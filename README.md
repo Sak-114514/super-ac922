@@ -6,6 +6,11 @@
 
 # 1Cat-vLLM
 
+> **AC922 ppc64le build snapshot:** This branch adds [POWER9/V100 build notes,
+> scripts, dependency hashes, and experimental wheel manifests](ac922/README.md).
+> It is derived from upstream commit `db292f9a4`; model serving is not yet
+> verified on the AC922.
+
 ## Make Volta Fast Again
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70

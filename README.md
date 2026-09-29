@@ -1,5 +1,9 @@
 <!-- markdownlint-disable MD041 -->
 
+> 📖 **中文说明 / Chinese guide:** [README.zh-CN.md](README.zh-CN.md) —
+> AC922 POWER9/V100 构建快照、TP3+DFlash2 试验记录与踩坑笔记。
+
+
 <p align="center">
   <img src="./assets/1cat-vllm-logo.png" alt="1Cat-vLLM logo" width="420">
 </p>

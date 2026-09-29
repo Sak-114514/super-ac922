@@ -1,0 +1,1 @@
+{"prompt_tokens":64000,"cache_salt":"ac922-tp3-1790697128772472376","generated_tokens":128,"stream_events":32,"first_chunk_tokens":1,"ttft_s":35.735,"prefill_tps":1790.97,"decode_s":1.821,"decode_tps_after_first_token":69.74,"decode_tps_after_first_chunk":69.74,"total_s":37.556}

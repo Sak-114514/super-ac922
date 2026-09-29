@@ -1,0 +1,78 @@
+From 4880cf6e1d3f2135cb9269bb51c01af88a4e4b98 Mon Sep 17 00:00:00 2001
+From: Sak-114514 <Sak-114514@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 21:47:51 +0800
+Subject: [PATCH 1/3] Keep the DFlash trial within the measured V100 memory
+ margin
+
+The depth-four candidate met the single-stream throughput and short-request
+four-way targets, but a 0.95 memory fraction OOMed on four 16k requests.
+The 0.94 fraction retained a 64k single request and 30-minute four-way 1k
+stability without that OOM, so the isolated launcher now defaults to it.
+Document the observed concurrency limit and the exact-norm A/B tradeoff.
+
+Constraint: Three 16GB V100s and an opt-in 64k DFlash2 trial
+Rejected: 0.95 utilization | four 16k requests triggered CUDA OOM
+Rejected: Native exact gated norm | fixed one near-tie output but lost four-way 1k admission
+Confidence: medium
+Scope-risk: narrow
+Reversibility: clean
+Directive: Do not infer four-way long-context capacity from the short-request stability result
+Tested: 1804s four-way 1k run at 0.94 with 1311 successful requests; 64k greedy request; 16k four-way pilot; shell syntax and git diff check
+Not-tested: Four simultaneous full-64k contexts; production switch; full-project CI
+---
+ tools/ac922/README.md          | 15 ++++++++++-----
+ tools/ac922/serve_tp3_trial.sh |  4 ++--
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/tools/ac922/README.md b/tools/ac922/README.md
+index 445bf4c11..3bfe822a6 100644
+--- a/tools/ac922/README.md
++++ b/tools/ac922/README.md
+@@ -70,12 +70,17 @@ sh tools/ac922/serve_tp3_trial.sh dflash
+ ```
+ 
+ The baseline defaults to a 200k window and 0.90 GPU utilization. The DFlash2
+-mode defaults to a 64k window, depth 3, 0.93 utilization, and four schedulable
+-requests. Override with `AC922_MAX_MODEL_LEN`, `AC922_DFLASH_DEPTH`, or
++trial defaults to a 64k window, depth 4, and 0.94 utilization. Override with
++`AC922_MAX_MODEL_LEN`, `AC922_DFLASH_DEPTH`, or
+ `AC922_GPU_MEMORY_UTILIZATION` for experiments. Depth 7 achieved higher
+-single-stream decode speed, while the measured four-way configuration uses
+-depth 3 and a five-group KV layout. Four simultaneous full-64k requests do
+-not fit in the measured KV pool.
++single-stream decode speed, but could not schedule four 1k requests. Depth 4
++at 0.95 passed a 30-minute four-way 1k trial, then CUDA-OOMed on four 16k
++prompts. At 0.94, four 1k requests ran without waiting and a 64k request
++completed; four 16k requests completed without OOM but only three ran at once.
++Four simultaneous full-64k requests do not fit in the measured KV pool.
++The optional native exact gated-norm path corrected one near-tie greedy
++divergence in an A/B run, but reduced the KV pool enough to prevent four
++simultaneous 1k requests; it is therefore not enabled by this launcher.
+ 
+ `compare_greedy_tp2_tp3.py` captures and compares deterministic output token
+ IDs. `bench_stream_token_ids.py` counts token IDs inside streamed chunks;
+diff --git a/tools/ac922/serve_tp3_trial.sh b/tools/ac922/serve_tp3_trial.sh
+index df42ef47a..578e29d4d 100755
+--- a/tools/ac922/serve_tp3_trial.sh
++++ b/tools/ac922/serve_tp3_trial.sh
+@@ -6,7 +6,7 @@ set -eu
+ mode=${1:-baseline}
+ case "$mode" in
+     baseline) default_len=200000; default_util=0.90 ;;
+-    dflash) default_len=65536; default_util=0.93 ;;
++    dflash) default_len=65536; default_util=0.94 ;;
+     *) echo "usage: $0 baseline|dflash" >&2; exit 2 ;;
+ esac
+ model=${AC922_MODEL_PATH:-/home/debian/models/qwen3.8-27b-awq-nicosuter}
+@@ -51,7 +51,7 @@ case "$mode" in
+         test -d "$draft"
+         export VLLM_USE_V2_MODEL_RUNNER=1
+         export AC922_TP3_DFLASH_REPLICATE=1
+-        depth=${AC922_DFLASH_DEPTH:-3}
++        depth=${AC922_DFLASH_DEPTH:-4}
+         case "$depth" in 1|2|3|4|5|6|7) ;; *) echo "invalid DFlash depth" >&2; exit 2 ;; esac
+         spec="{\"method\":\"dflash\",\"model\":\"$draft\",\"num_speculative_tokens\":$depth,\"draft_tensor_parallel_size\":3,\"draft_sample_method\":\"probabilistic\",\"kv_cache_dtype\":\"auto\"}"
+         set -- "$@" --speculative-config "$spec"
+-- 
+2.50.1 (Apple Git-155)
+

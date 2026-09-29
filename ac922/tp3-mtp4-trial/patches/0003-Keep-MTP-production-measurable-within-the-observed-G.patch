@@ -1,0 +1,533 @@
+From 7d2d75edf715d7b0f0bafe35f3a4140c265dd986 Mon Sep 17 00:00:00 2001
+From: Sak-114514 <Sak-114514@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 00:00:28 +0800
+Subject: [PATCH 3/3] Keep MTP production measurable within the observed GPU
+ headroom
+
+An isolated MTP4 TP3 service now owns the established coding API endpoint.
+The DFlash unit and runtime remain intact for rollback. Streaming token-ID
+benchmarks and bounded concurrency waves exposed a cold production CUDA Graph
+allocation that made 0.91 unsafe at idle; the production unit uses 0.88 and
+has completed a cold-prefix 64k request plus an authenticated four-way 50k
+wave. The benchmark tools retain both per-client and overlapping-decode rates
+so long prefill time is not mislabeled as decode throughput.
+
+Constraint: Three 16GB V100s, existing 8000 API key and coding middleware, no reboot
+Rejected: 0.91 production utilization | cold graph capture left only 37-38 MiB idle free
+Rejected: 0.92 long-input admission | short four-way wave left 237 MiB before longer contexts
+Confidence: medium
+Scope-risk: moderate
+Reversibility: clean
+Directive: Do not raise production utilization from 0.88 without rechecking cold-start graph memory and authenticated four-way 50k headroom
+Tested: Ruff check/format; shell syntax; systemd unit verification; matching deployed file hashes; unauthorized HTTP 401; authorized OpenAI chat and Anthropic messages HTTP 200; 64k streamed completion; 4x50k authenticated wave with four running, no waiting or errors
+Not-tested: Production 4x60k, 30-minute stability, reboot, full-project CI, token-by-token quality parity
+---
+ tools/ac922/README.md                         |  11 +-
+ tools/ac922/ac922-coding-api-tp3-mtp.service  |  21 ++
+ tools/ac922/bench_concurrent_token_ids.py     | 243 ++++++++++++++++++
+ tools/ac922/bench_stream_token_ids.py         |  13 +-
+ tools/ac922/stability_tp3.py                  |  25 +-
+ .../ac922/start_coding_api_tp3_mtp_gpu012.sh  |  49 ++++
+ 6 files changed, 349 insertions(+), 13 deletions(-)
+ create mode 100644 tools/ac922/ac922-coding-api-tp3-mtp.service
+ create mode 100644 tools/ac922/bench_concurrent_token_ids.py
+ create mode 100644 tools/ac922/start_coding_api_tp3_mtp_gpu012.sh
+
+diff --git a/tools/ac922/README.md b/tools/ac922/README.md
+index 83d467cf0..766f09d1b 100644
+--- a/tools/ac922/README.md
++++ b/tools/ac922/README.md
+@@ -1,4 +1,4 @@
+-# AC922 TP3 head replication and DFlash2 trial
++# AC922 TP3 head replication and speculative trials
+ 
+ This branch starts from `db292f9a4` of the 1Cat fork. It targets the local
+ Qwen3.8-27B AWQ checkpoint with 24 Q / 4 KV attention heads, 16 full-attention
+@@ -96,6 +96,9 @@ GPU temperatures. Test results for this AC922 are in the companion
+ The `mtp` mode is a separate native MTP4 trial using the model's local
+ `model-mtp.safetensors`. It opts into TP3 head replication for the MTP layer,
+ keeps the target and MTP attention KV in FP8 E4M3, and defaults to a 64k
+-window at 0.90 GPU utilization. Its 1k and 64k single-request checks do not
+-establish concurrent or long-running production stability. The production
+-coding API remains on the independently tested DFlash2 configuration.
++window at 0.90 GPU utilization. The production MTP user service uses a
++separate persistent runtime and sets utilization to 0.88 after a cold 0.91
++production start left insufficient GPU headroom. The DFlash unit and runtime
++remain available for rollback. The bounded 1k, 64k, and four-way 50k results
++are documented in the companion `MTP-TP3-1K-64K.md` report; they do not
++establish 30-minute stability or four-way 60k production capacity.
+diff --git a/tools/ac922/ac922-coding-api-tp3-mtp.service b/tools/ac922/ac922-coding-api-tp3-mtp.service
+new file mode 100644
+index 000000000..ddc05825f
+--- /dev/null
++++ b/tools/ac922/ac922-coding-api-tp3-mtp.service
+@@ -0,0 +1,21 @@
++[Unit]
++Description=AC922 Qwen3.8 coding API (native MTP4 TP3 FP8 GPU0/1/2)
++After=network.target
++Conflicts=ac922-coding-api-tp3.service ac922-coding-api-tp2.service
++StartLimitIntervalSec=600
++StartLimitBurst=2
++
++[Service]
++Type=simple
++Environment=AC922_GPU_MEMORY_UTILIZATION=0.88
++WorkingDirectory=/home/debian/ac922-vllm
++ExecStartPre=/usr/bin/test -s /home/debian/ac922-vllm/runtime-tp3-mtp-20260929/site-packages/vllm/__init__.py
++ExecStart=/bin/sh /home/debian/ac922-vllm/start_coding_api_tp3_mtp_gpu012.sh
++Restart=on-failure
++RestartSec=30
++TimeoutStopSec=30
++StandardOutput=append:/home/debian/ac922-vllm/coding-api-tp3-mtp.log
++StandardError=append:/home/debian/ac922-vllm/coding-api-tp3-mtp.log
++
++[Install]
++WantedBy=default.target
+diff --git a/tools/ac922/bench_concurrent_token_ids.py b/tools/ac922/bench_concurrent_token_ids.py
+new file mode 100644
+index 000000000..a44d01813
+--- /dev/null
++++ b/tools/ac922/bench_concurrent_token_ids.py
+@@ -0,0 +1,243 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Measure one concurrent streaming wave using returned token IDs."""
++
++import argparse
++import json
++import random
++import re
++import statistics
++import subprocess
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from urllib.request import Request, urlopen
++
++METRIC = re.compile(
++    r"^vllm:(num_requests_running|num_requests_waiting)\{[^}]*\} ([0-9.]+)$",
++    re.M,
++)
++
++
++def request_once(
++    worker_id: int,
++    barrier: threading.Barrier,
++    url: str,
++    model: str,
++    length: int,
++    max_tokens: int,
++    key: str | None,
++) -> dict:
++    rng = random.Random(20260929 + worker_id * 1000000 + length)
++    body = {
++        "model": model,
++        "prompt": [rng.randrange(5000, 150000) for _ in range(length)],
++        "max_tokens": max_tokens,
++        "min_tokens": max_tokens,
++        "temperature": 0.0,
++        "stream": True,
++        "ignore_eos": True,
++        "return_token_ids": True,
++        "cache_salt": f"mtp-concurrent-{length}-{worker_id}-{time.time_ns()}",
++    }
++    headers = {"Content-Type": "application/json"}
++    if key:
++        headers["Authorization"] = f"Bearer {key}"
++    request = Request(
++        url,
++        data=json.dumps(body).encode(),
++        headers=headers,
++    )
++    barrier.wait()
++    started = time.monotonic()
++    events: list[tuple[float, int]] = []
++    try:
++        with urlopen(request, timeout=300) as response:
++            for line in response:
++                if not line.startswith(b"data:"):
++                    continue
++                payload = line[5:].strip()
++                if payload == b"[DONE]":
++                    continue
++                choices = json.loads(payload).get("choices") or []
++                token_ids = choices[0].get("token_ids") or [] if choices else []
++                if token_ids:
++                    events.append((time.monotonic(), len(token_ids)))
++        finished = time.monotonic()
++        generated = sum(count for _, count in events)
++        if generated != max_tokens:
++            raise ValueError(f"generated {generated} of {max_tokens} tokens")
++        first = events[0][0]
++        decode_seconds = finished - first
++        return {
++            "worker": worker_id,
++            "started": started,
++            "first": first,
++            "finished": finished,
++            "events": events,
++            "generated_tokens": generated,
++            "ttft_s": round(first - started, 3),
++            "decode_tps": round((generated - events[0][1]) / decode_seconds, 2),
++            "total_s": round(finished - started, 3),
++        }
++    except Exception as exc:
++        return {"worker": worker_id, "error": repr(exc), "started": started}
++
++
++def watch(base: str, stop: threading.Event, samples: list[dict]) -> None:
++    last_gpu = 0.0
++    gpu_c: list[int] = []
++    gpu_free_mib: list[int] = []
++    while not stop.is_set():
++        now = time.monotonic()
++        try:
++            with urlopen(f"{base}/metrics", timeout=5) as response:
++                metrics = {
++                    key: int(float(value))
++                    for key, value in METRIC.findall(response.read().decode())
++                }
++            if now - last_gpu >= 5:
++                result = subprocess.run(
++                    [
++                        "nvidia-smi",
++                        "--query-gpu=temperature.gpu,memory.free",
++                        "--format=csv,noheader,nounits",
++                    ],
++                    capture_output=True,
++                    text=True,
++                    timeout=5,
++                    check=True,
++                )
++                values = [line.split(",") for line in result.stdout.splitlines()[:3]]
++                gpu_c = [int(value[0]) for value in values]
++                gpu_free_mib = [int(value[1]) for value in values]
++                last_gpu = now
++            samples.append(
++                {"time": now, **metrics, "gpu_c": gpu_c, "gpu_free_mib": gpu_free_mib}
++            )
++        except Exception as exc:
++            samples.append({"time": now, "monitor_error": repr(exc)})
++        stop.wait(0.5)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--base", default="http://127.0.0.1:8003")
++    parser.add_argument("--model", default="qwen3.8-27b-ac922")
++    parser.add_argument("--clients", type=int, required=True)
++    parser.add_argument("--prompt-length", type=int, required=True)
++    parser.add_argument("--max-tokens", type=int, required=True)
++    parser.add_argument("--key-file", type=Path)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    if not 1 <= args.clients <= 8 or args.prompt_length < 1 or args.max_tokens < 2:
++        parser.error("clients must be 1..8; lengths must be positive")
++    if args.output.exists():
++        raise FileExistsError(args.output)
++    key = args.key_file.read_text().strip() if args.key_file else None
++
++    barrier = threading.Barrier(args.clients)
++    stop = threading.Event()
++    samples: list[dict] = []
++    monitor = threading.Thread(
++        target=watch, args=(args.base, stop, samples), daemon=True
++    )
++    monitor.start()
++    with ThreadPoolExecutor(max_workers=args.clients) as pool:
++        futures = [
++            pool.submit(
++                request_once,
++                worker_id,
++                barrier,
++                f"{args.base}/v1/completions",
++                args.model,
++                args.prompt_length,
++                args.max_tokens,
++                key,
++            )
++            for worker_id in range(args.clients)
++        ]
++        results = [future.result() for future in futures]
++    stop.set()
++    monitor.join(timeout=5)
++
++    good = [record for record in results if "error" not in record]
++    first_all = max((record["first"] for record in good), default=0.0)
++    finish_first = min((record["finished"] for record in good), default=0.0)
++    all_live_tokens = sum(
++        count
++        for record in good
++        for event_time, count in record["events"]
++        if first_all < event_time <= finish_first
++    )
++    all_live_seconds = max(0.0, finish_first - first_all)
++    total_seconds = max((record["finished"] for record in good), default=0.0) - min(
++        (record["started"] for record in results), default=0.0
++    )
++    summary = {
++        "clients": args.clients,
++        "prompt_tokens_each": args.prompt_length,
++        "completed": len(good),
++        "errors": [record for record in results if "error" in record],
++        "generated_tokens": sum(record["generated_tokens"] for record in good),
++        "elapsed_s": round(total_seconds, 3),
++        "end_to_end_output_tps": round(
++            sum(record["generated_tokens"] for record in good) / total_seconds, 2
++        )
++        if total_seconds > 0
++        else None,
++        "median_client_ttft_s": round(
++            statistics.median(record["ttft_s"] for record in good), 3
++        )
++        if good
++        else None,
++        "median_client_decode_tps": round(
++            statistics.median(record["decode_tps"] for record in good), 2
++        )
++        if good
++        else None,
++        "all_live_decode_tps": round(all_live_tokens / all_live_seconds, 2)
++        if all_live_seconds > 0
++        else None,
++        "all_live_tokens": all_live_tokens,
++        "max_running": max(
++            (sample.get("num_requests_running", -1) for sample in samples),
++            default=-1,
++        ),
++        "max_waiting": max(
++            (sample.get("num_requests_waiting", -1) for sample in samples),
++            default=-1,
++        ),
++        "max_gpu_c": max(
++            (
++                temperature
++                for sample in samples
++                for temperature in sample.get("gpu_c", [])
++            ),
++            default=None,
++        ),
++        "min_gpu_free_mib": min(
++            (free for sample in samples for free in sample.get("gpu_free_mib", [])),
++            default=None,
++        ),
++        "requests": results,
++        "samples": samples,
++    }
++    args.output.write_text(json.dumps(summary, indent=2) + "\n")
++    print(
++        json.dumps(
++            {
++                key: value
++                for key, value in summary.items()
++                if key not in ("requests", "samples")
++            }
++        )
++    )
++    if len(good) != args.clients:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/ac922/bench_stream_token_ids.py b/tools/ac922/bench_stream_token_ids.py
+index fe999dc87..55c99f517 100755
+--- a/tools/ac922/bench_stream_token_ids.py
++++ b/tools/ac922/bench_stream_token_ids.py
+@@ -11,7 +11,9 @@ from pathlib import Path
+ from urllib.request import Request, urlopen
+ 
+ 
+-def run(url: str, model: str, length: int, max_tokens: int) -> dict:
++def run(
++    url: str, model: str, length: int, max_tokens: int, key: str | None = None
++) -> dict:
+     generator = random.Random(length)
+     prompt = [generator.randrange(5000, 150000) for _ in range(length)]
+     cache_salt = f"ac922-tp3-{time.time_ns()}"
+@@ -26,10 +28,13 @@ def run(url: str, model: str, length: int, max_tokens: int) -> dict:
+         "return_token_ids": True,
+         "cache_salt": cache_salt,
+     }
++    headers = {"Content-Type": "application/json"}
++    if key:
++        headers["Authorization"] = f"Bearer {key}"
+     request = Request(
+         url,
+         data=json.dumps(body).encode(),
+-        headers={"Content-Type": "application/json"},
++        headers=headers,
+     )
+     started = time.monotonic()
+     ttft = None
+@@ -85,11 +90,13 @@ def main() -> None:
+     parser.add_argument("lengths", help="Comma-separated prompt lengths")
+     parser.add_argument("--max-tokens", type=int, default=128)
+     parser.add_argument("--model", default="qwen3.8-27b-ac922")
++    parser.add_argument("--key-file", type=Path)
+     args = parser.parse_args()
+     if args.output.exists():
+         raise FileExistsError(args.output)
++    key = args.key_file.read_text().strip() if args.key_file else None
+     for length in (int(value) for value in args.lengths.split(",")):
+-        record = run(args.url, args.model, length, args.max_tokens)
++        record = run(args.url, args.model, length, args.max_tokens, key)
+         print(json.dumps(record), flush=True)
+         with args.output.open("a") as output:
+             output.write(json.dumps(record, separators=(",", ":")) + "\n")
+diff --git a/tools/ac922/stability_tp3.py b/tools/ac922/stability_tp3.py
+index 36b577de4..81e816355 100755
+--- a/tools/ac922/stability_tp3.py
++++ b/tools/ac922/stability_tp3.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Sustain four real requests while recording scheduler and thermal evidence."""
++"""Run concurrent requests while recording scheduler and thermal evidence."""
+ 
+ import argparse
+ import json
+@@ -82,13 +82,18 @@ def worker(
+     model: str,
+     prompt_length: int,
+     max_tokens: int,
++    requests_per_client: int,
+     path: Path,
+     stop: threading.Event,
+     lock: threading.Lock,
+ ) -> None:
+     barrier.wait()
+     iteration = 0
+-    while time.monotonic() < deadline and not stop.is_set():
++    while (
++        time.monotonic() < deadline
++        and not stop.is_set()
++        and (requests_per_client == 0 or iteration < requests_per_client)
++    ):
+         generator = random.Random(20260929 + worker_id * 1000000 + iteration)
+         prompt = [generator.randrange(5000, 150000) for _ in range(prompt_length)]
+         body = {
+@@ -131,10 +136,14 @@ def main() -> None:
+     parser.add_argument("--base", default="http://127.0.0.1:8003")
+     parser.add_argument("--output-prefix", type=Path, required=True)
+     parser.add_argument("--duration", type=int, default=1800)
++    parser.add_argument("--clients", type=int, default=4)
++    parser.add_argument("--requests-per-client", type=int, default=0)
+     parser.add_argument("--prompt-length", type=int, default=8000)
+     parser.add_argument("--max-tokens", type=int, default=512)
+     parser.add_argument("--model", default="qwen3.8-27b-ac922")
+     args = parser.parse_args()
++    if not 1 <= args.clients <= 8 or args.requests_per_client < 0:
++        parser.error("clients must be 1..8 and requests-per-client must be >= 0")
+     requests_path = args.output_prefix.with_suffix(".requests.jsonl")
+     metrics_path = args.output_prefix.with_suffix(".metrics.jsonl")
+     summary_path = args.output_prefix.with_suffix(".summary.json")
+@@ -143,7 +152,7 @@ def main() -> None:
+     lock = threading.Lock()
+     stop = threading.Event()
+     finished = threading.Event()
+-    barrier = threading.Barrier(4)
++    barrier = threading.Barrier(args.clients)
+     start = time.monotonic()
+     watcher = threading.Thread(
+         target=monitor,
+@@ -151,7 +160,7 @@ def main() -> None:
+         daemon=True,
+     )
+     watcher.start()
+-    with ThreadPoolExecutor(max_workers=4) as pool:
++    with ThreadPoolExecutor(max_workers=args.clients) as pool:
+         futures = [
+             pool.submit(
+                 worker,
+@@ -162,11 +171,12 @@ def main() -> None:
+                 args.model,
+                 args.prompt_length,
+                 args.max_tokens,
++                args.requests_per_client,
+                 requests_path,
+                 stop,
+                 lock,
+             )
+-            for worker_id in range(4)
++            for worker_id in range(args.clients)
+         ]
+         for future in futures:
+             future.result()
+@@ -184,11 +194,14 @@ def main() -> None:
+         "max_running": max((s.get("running", -1) for s in samples), default=-1),
+         "max_waiting": max((s.get("waiting", -1) for s in samples), default=-1),
+         "samples_running_four": sum(s.get("running") == 4 for s in samples),
++        "samples_running_clients": sum(
++            s.get("running") == args.clients for s in samples
++        ),
+         "max_gpu_c": max(temperatures, default=None),
+     }
+     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+     print(json.dumps(summary), flush=True)
+-    if errors or stop.is_set() or summary["max_running"] < 4:
++    if errors or stop.is_set() or summary["max_running"] < args.clients:
+         raise SystemExit(1)
+ 
+ 
+diff --git a/tools/ac922/start_coding_api_tp3_mtp_gpu012.sh b/tools/ac922/start_coding_api_tp3_mtp_gpu012.sh
+new file mode 100644
+index 000000000..8792f4df5
+--- /dev/null
++++ b/tools/ac922/start_coding_api_tp3_mtp_gpu012.sh
+@@ -0,0 +1,49 @@
++#!/bin/sh
++# SPDX-License-Identifier: Apache-2.0
++set -eu
++
++root=/home/debian/ac922-vllm
++site=$root/runtime-tp3-mtp-20260929/site-packages
++key=$root/coding-api.key
++test -s "$key"
++test -s "$site/vllm/__init__.py"
++export VLLM_API_KEY=$(cat "$key")
++
++# The user manager may start before LAN and NVIDIA devices are ready.
++attempts=0
++while [ "$attempts" -lt 60 ]; do
++    if [ -c /dev/nvidia-uvm ] &&
++        /usr/bin/ip -4 addr show | grep -q '192\.168\.1\.205/'; then
++        gpu_count=$(/usr/local/bin/nvidia-smi \
++            --query-gpu=index --format=csv,noheader,nounits 2>/dev/null |
++            awk 'NF {count++} END {print count+0}')
++        if [ "$gpu_count" -eq 6 ]; then
++            break
++        fi
++    fi
++    attempts=$((attempts + 1))
++    sleep 5
++done
++if [ "$attempts" -eq 60 ]; then
++    echo 'AC922 TP3 coding API: GPU or LAN readiness timed out' >&2
++    exit 1
++fi
++
++export AC922_RUN_ROOT=/dev/shm/ac922-tp3-mtp-prod
++export AC922_RUNTIME_ROOT=$root/runtime-525-20260928
++export AC922_VLLM_SITE=$site
++export CUDA_VISIBLE_DEVICES=0,1,2
++export AC922_BIND_HOST=127.0.0.1
++export AC922_TP3_PORT=8000
++export AC922_MAX_MODEL_LEN=${AC922_MAX_MODEL_LEN:-65536}
++export AC922_MTP_DEPTH=${AC922_MTP_DEPTH:-4}
++export AC922_GPU_MEMORY_UTILIZATION=${AC922_GPU_MEMORY_UTILIZATION:-0.88}
++export AC922_MAX_NUM_SEQS=${AC922_MAX_NUM_SEQS:-4}
++export AC922_MAX_NUM_BATCHED_TOKENS=${AC922_MAX_NUM_BATCHED_TOKENS:-4096}
++export VLLM_SM70_RMSNORM_GATED_EXACT=0
++export AC922_CODING_API=1
++export AC922_MIDDLEWARE=coding_api_middleware.clamp_oversized_completion
++export AC922_SERVED_MODEL_NAME=qwen3.8-27b-ac922
++export AC922_ANTHROPIC_MAX_COMPLETION_TOKENS=8192
++
++exec sh "$root/serve_tp3_mtp.sh" mtp
+-- 
+2.50.1 (Apple Git-155)
+

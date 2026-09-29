@@ -1,0 +1,400 @@
+From 9bfd13fe3c67a7cd88fe76f90c1059054cc72642 Mon Sep 17 00:00:00 2001
+From: Sak-114514 <Sak-114514@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 22:58:53 +0800
+Subject: [PATCH 2/3] Keep TP3 production reversible while measuring native MTP
+ capacity
+
+The AC922 coding API now has an isolated TP3 service path that preserves its
+existing key and middleware. Native MTP uses a separate checkpoint config, so
+its one BF16 attention layer and MLP need the same in-memory TP3 expansion as
+the target. The MTP path remains opt-in for a bounded trial while DFlash2
+continues to serve production.
+
+Constraint: Three 16GB V100s, local Qwen3.8-27B AWQ and MTP checkpoints, no reboot
+Rejected: Replace production with MTP after two requests | concurrent stability and output quality are unverified
+Confidence: medium
+Scope-risk: moderate
+Reversibility: clean
+Directive: Do not enable the MTP trial as production without capacity, quality, and concurrent-request gates
+Tested: Ruff check/format; shell syntax; TP3 target/draft config smoke; seven real BF16 MTP tensor transforms; 1k and 64k streamed requests with 128 output tokens and no OOM
+Not-tested: 200k MTP request, 30-minute stability, multi-client concurrency, full-project CI, reboot
+---
+ tests/models/qwen3_5/check_mtp_tp3_weights.py | 51 +++++++++++++++++++
+ tools/ac922/README.md                         | 11 ++++
+ tools/ac922/ac922-coding-api-tp3.service      | 20 ++++++++
+ tools/ac922/serve_tp3_trial.sh                | 23 +++++++--
+ tools/ac922/start_coding_api_tp3_gpu012.sh    | 49 ++++++++++++++++++
+ vllm/config/speculative.py                    | 22 ++++++++
+ vllm/model_executor/models/qwen3_5_mtp.py     | 20 ++++++++
+ .../models/qwen3_5_tp3_heads.py               | 37 ++++++++++++++
+ 8 files changed, 230 insertions(+), 3 deletions(-)
+ create mode 100644 tests/models/qwen3_5/check_mtp_tp3_weights.py
+ create mode 100644 tools/ac922/ac922-coding-api-tp3.service
+ create mode 100644 tools/ac922/start_coding_api_tp3_gpu012.sh
+
+diff --git a/tests/models/qwen3_5/check_mtp_tp3_weights.py b/tests/models/qwen3_5/check_mtp_tp3_weights.py
+new file mode 100644
+index 000000000..1a788cab2
+--- /dev/null
++++ b/tests/models/qwen3_5/check_mtp_tp3_weights.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Stream the local BF16 MTP checkpoint through AC922 TP3 head replication."""
++
++import sys
++
++import torch
++from safetensors import safe_open
++
++from vllm.model_executor.models.qwen3_5_tp3_heads import replicate_tp3_mtp_weights
++
++
++def main(path: str) -> None:
++    expected = {
++        "mtp.layers.0.self_attn.q_proj.weight": (18432, 5120),
++        "mtp.layers.0.self_attn.k_proj.weight": (1536, 5120),
++        "mtp.layers.0.self_attn.v_proj.weight": (1536, 5120),
++        "mtp.layers.0.self_attn.o_proj.weight": (5120, 9216),
++        "mtp.layers.0.mlp.gate_proj.weight": (17664, 5120),
++        "mtp.layers.0.mlp.up_proj.weight": (17664, 5120),
++        "mtp.layers.0.mlp.down_proj.weight": (5120, 17664),
++    }
++    seen: set[str] = set()
++    with safe_open(path, framework="pt", device="cpu") as checkpoint:
++        weights = ((name, checkpoint.get_tensor(name)) for name in checkpoint)
++        for name, expanded in replicate_tp3_mtp_weights(weights):
++            if name not in expected:
++                continue
++            assert expanded.dtype == torch.bfloat16
++            assert tuple(expanded.shape) == expected[name], name
++            original = checkpoint.get_tensor(name)
++            if name.endswith("o_proj.weight"):
++                assert torch.equal(expanded[:, :3072] * 2, original[:, :3072])
++                assert torch.equal(expanded[:, 3072:6144], original[:, 3072:])
++                assert torch.equal(expanded[:, 6144:], expanded[:, :3072])
++            elif name.endswith("q_proj.weight"):
++                assert torch.equal(expanded[12288:], original[:6144])
++            elif name.endswith(("k_proj.weight", "v_proj.weight")):
++                assert torch.equal(expanded[1024:], original[:512])
++            elif name.endswith(("gate_proj.weight", "up_proj.weight")):
++                assert not torch.count_nonzero(expanded[17408:])
++            elif name.endswith("down_proj.weight"):
++                assert not torch.count_nonzero(expanded[:, 17408:])
++            seen.add(name)
++    assert seen == set(expected), seen
++    print("PASS MTP BF16 checkpoint: seven TP3 tensors and half-output invariant")
++
++
++if __name__ == "__main__":
++    main(sys.argv[1])
+diff --git a/tools/ac922/README.md b/tools/ac922/README.md
+index 3bfe822a6..83d467cf0 100644
+--- a/tools/ac922/README.md
++++ b/tools/ac922/README.md
+@@ -67,6 +67,7 @@ Use GPUs 0/1/2 after confirming they are available. Both modes bind
+ ```sh
+ sh tools/ac922/serve_tp3_trial.sh baseline
+ sh tools/ac922/serve_tp3_trial.sh dflash
++sh tools/ac922/serve_tp3_trial.sh mtp
+ ```
+ 
+ The baseline defaults to a 200k window and 0.90 GPU utilization. The DFlash2
+@@ -81,6 +82,9 @@ Four simultaneous full-64k requests do not fit in the measured KV pool.
+ The optional native exact gated-norm path corrected one near-tie greedy
+ divergence in an A/B run, but reduced the KV pool enough to prevent four
+ simultaneous 1k requests; it is therefore not enabled by this launcher.
++The same launcher can serve the existing coding API when its bind host,
++port, API key, reasoning/tool parsers, and middleware are supplied by the
++production wrapper. Its defaults remain local-only for experiments.
+ 
+ `compare_greedy_tp2_tp3.py` captures and compares deterministic output token
+ IDs. `bench_stream_token_ids.py` counts token IDs inside streamed chunks;
+@@ -88,3 +92,10 @@ counting SSE messages understates speculative decode throughput.
+ `stability_tp3.py` logs completed requests, scheduler Running/Waiting, and
+ GPU temperatures. Test results for this AC922 are in the companion
+ `ac922-vllm/bench-results/2026-09-29-tp3/REPORT.md` workspace artifact.
++
++The `mtp` mode is a separate native MTP4 trial using the model's local
++`model-mtp.safetensors`. It opts into TP3 head replication for the MTP layer,
++keeps the target and MTP attention KV in FP8 E4M3, and defaults to a 64k
++window at 0.90 GPU utilization. Its 1k and 64k single-request checks do not
++establish concurrent or long-running production stability. The production
++coding API remains on the independently tested DFlash2 configuration.
+diff --git a/tools/ac922/ac922-coding-api-tp3.service b/tools/ac922/ac922-coding-api-tp3.service
+new file mode 100644
+index 000000000..e05173fda
+--- /dev/null
++++ b/tools/ac922/ac922-coding-api-tp3.service
+@@ -0,0 +1,20 @@
++[Unit]
++Description=AC922 Qwen3.8 coding API (DFlash2 TP3 FP8 GPU0/1/2)
++After=network.target
++Conflicts=ac922-coding-api-tp2.service
++StartLimitIntervalSec=600
++StartLimitBurst=2
++
++[Service]
++Type=simple
++WorkingDirectory=/home/debian/ac922-vllm
++ExecStartPre=/usr/bin/test -s /home/debian/ac922-vllm/runtime-tp3-dflash-20260929/site-packages/vllm/__init__.py
++ExecStart=/bin/sh /home/debian/ac922-vllm/start_coding_api_tp3_gpu012.sh
++Restart=on-failure
++RestartSec=30
++TimeoutStopSec=30
++StandardOutput=append:/home/debian/ac922-vllm/coding-api-tp3.log
++StandardError=append:/home/debian/ac922-vllm/coding-api-tp3.log
++
++[Install]
++WantedBy=default.target
+diff --git a/tools/ac922/serve_tp3_trial.sh b/tools/ac922/serve_tp3_trial.sh
+index 578e29d4d..3f5d9cdf1 100755
+--- a/tools/ac922/serve_tp3_trial.sh
++++ b/tools/ac922/serve_tp3_trial.sh
+@@ -7,7 +7,8 @@ mode=${1:-baseline}
+ case "$mode" in
+     baseline) default_len=200000; default_util=0.90 ;;
+     dflash) default_len=65536; default_util=0.94 ;;
+-    *) echo "usage: $0 baseline|dflash" >&2; exit 2 ;;
++    mtp) default_len=65536; default_util=0.90 ;;
++    *) echo "usage: $0 baseline|dflash|mtp" >&2; exit 2 ;;
+ esac
+ model=${AC922_MODEL_PATH:-/home/debian/models/qwen3.8-27b-awq-nicosuter}
+ draft=${AC922_DFLASH_MODEL:-/home/debian/models/qwen3.8-27b-dflash2}
+@@ -42,8 +43,9 @@ set -- "$runner" -m vllm.entrypoints.cli.main serve "$model" \
+     --kv-cache-dtype fp8_e4m3 \
+     --language-model-only \
+     --limit-mm-per-prompt '{"image":0,"video":0}' \
+-    --served-model-name qwen3.8-27b-ac922 \
+-    --host 127.0.0.1 --port "${AC922_TP3_PORT:-8003}"
++    --served-model-name "${AC922_SERVED_MODEL_NAME:-qwen3.8-27b-ac922}" \
++    --host "${AC922_BIND_HOST:-127.0.0.1}" \
++    --port "${AC922_TP3_PORT:-8003}"
+ 
+ case "$mode" in
+     baseline) ;;
+@@ -56,6 +58,21 @@ case "$mode" in
+         spec="{\"method\":\"dflash\",\"model\":\"$draft\",\"num_speculative_tokens\":$depth,\"draft_tensor_parallel_size\":3,\"draft_sample_method\":\"probabilistic\",\"kv_cache_dtype\":\"auto\"}"
+         set -- "$@" --speculative-config "$spec"
+         ;;
++    mtp)
++        export AC922_TP3_MTP_REPLICATE=1
++        depth=${AC922_MTP_DEPTH:-4}
++        case "$depth" in 1|2|3|4) ;; *) echo "invalid MTP depth" >&2; exit 2 ;; esac
++        spec="{\"method\":\"mtp\",\"num_speculative_tokens\":$depth,\"draft_tensor_parallel_size\":3,\"draft_sample_method\":\"greedy\",\"attention_backend\":\"FLASH_ATTN_V100\",\"kv_cache_dtype\":\"fp8_e4m3\"}"
++        set -- "$@" --speculative-config "$spec"
++        ;;
+ esac
+ 
++if [ "${AC922_CODING_API:-0}" = 1 ]; then
++    set -- "$@" --reasoning-parser qwen3 \
++        --enable-auto-tool-choice --tool-call-parser qwen3_coder
++fi
++if [ -n "${AC922_MIDDLEWARE:-}" ]; then
++    set -- "$@" --middleware "$AC922_MIDDLEWARE"
++fi
++
+ exec "$@"
+diff --git a/tools/ac922/start_coding_api_tp3_gpu012.sh b/tools/ac922/start_coding_api_tp3_gpu012.sh
+new file mode 100644
+index 000000000..e3120c7bb
+--- /dev/null
++++ b/tools/ac922/start_coding_api_tp3_gpu012.sh
+@@ -0,0 +1,49 @@
++#!/bin/sh
++# SPDX-License-Identifier: Apache-2.0
++set -eu
++
++root=/home/debian/ac922-vllm
++site=$root/runtime-tp3-dflash-20260929/site-packages
++key=$root/coding-api.key
++test -s "$key"
++test -s "$site/vllm/__init__.py"
++export VLLM_API_KEY=$(cat "$key")
++
++# The user manager may start before LAN and NVIDIA devices are ready.
++attempts=0
++while [ "$attempts" -lt 60 ]; do
++    if [ -c /dev/nvidia-uvm ] &&
++        /usr/bin/ip -4 addr show | grep -q '192\.168\.1\.205/'; then
++        gpu_count=$(/usr/local/bin/nvidia-smi \
++            --query-gpu=index --format=csv,noheader,nounits 2>/dev/null |
++            awk 'NF {count++} END {print count+0}')
++        if [ "$gpu_count" -eq 6 ]; then
++            break
++        fi
++    fi
++    attempts=$((attempts + 1))
++    sleep 5
++done
++if [ "$attempts" -eq 60 ]; then
++    echo 'AC922 TP3 coding API: GPU or LAN readiness timed out' >&2
++    exit 1
++fi
++
++export AC922_RUN_ROOT=/dev/shm/ac922-tp3-prod
++export AC922_RUNTIME_ROOT=$root/runtime-525-20260928
++export AC922_VLLM_SITE=$site
++export CUDA_VISIBLE_DEVICES=0,1,2
++export AC922_BIND_HOST=127.0.0.1
++export AC922_TP3_PORT=8000
++export AC922_MAX_MODEL_LEN=${AC922_MAX_MODEL_LEN:-65536}
++export AC922_DFLASH_DEPTH=${AC922_DFLASH_DEPTH:-4}
++export AC922_GPU_MEMORY_UTILIZATION=${AC922_GPU_MEMORY_UTILIZATION:-0.94}
++export AC922_MAX_NUM_SEQS=${AC922_MAX_NUM_SEQS:-4}
++export AC922_MAX_NUM_BATCHED_TOKENS=${AC922_MAX_NUM_BATCHED_TOKENS:-4096}
++export VLLM_SM70_RMSNORM_GATED_EXACT=0
++export AC922_CODING_API=1
++export AC922_MIDDLEWARE=coding_api_middleware.clamp_oversized_completion
++export AC922_SERVED_MODEL_NAME=qwen3.8-27b-ac922
++export AC922_ANTHROPIC_MAX_COMPLETION_TOKENS=8192
++
++exec sh "$root/serve_tp3_dflash.sh" dflash
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 749a5993e..019b5a2b4 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -621,6 +621,28 @@ class SpeculativeConfig:
+             )
+         if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+             is_moe = hf_config.model_type == "qwen3_5_moe"
++            if os.getenv("AC922_TP3_MTP_REPLICATE") == "1":
++                text_config = get_hf_text_config(hf_config)
++                expected = {
++                    "num_attention_heads": 24,
++                    "num_key_value_heads": 4,
++                    "linear_num_key_heads": 16,
++                    "linear_num_value_heads": 48,
++                    "intermediate_size": 17408,
++                }
++                for key, value in expected.items():
++                    if getattr(text_config, key, None) != value:
++                        raise ValueError(f"AC922 TP3 MTP requires {key}={value}")
++                text_config.update(
++                    {
++                        "num_attention_heads": 36,
++                        "num_key_value_heads": 6,
++                        "linear_num_key_heads": 18,
++                        "linear_num_value_heads": 54,
++                        "intermediate_size": 17664,
++                    }
++                )
++                hf_config.update({"ac922_tp3_head_replication": True})
+             hf_config.model_type = "qwen3_5_mtp"
+             n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+             hf_config.update(
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 46b8b9ad8..f1c83b420 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -125,6 +125,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         self.config = config
+ 
+         self.vocab_size = config.vocab_size
++        self.ac922_tp3 = bool(
++            getattr(model_config.hf_config, "ac922_tp3_head_replication", False)
++        )
+ 
+         if envs.VLLM_DEBUG_MTP_LOAD:
+             logger.warning(
+@@ -141,6 +144,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+             else VocabParallelEmbedding(
+                 self.vocab_size,
+                 config.hidden_size,
++                **({"padding_size": 192} if self.ac922_tp3 else {}),
+             )
+         )
+ 
+@@ -157,6 +161,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+             self.config.hidden_size * 2,
+             self.config.hidden_size,
+             gather_output=True,
++            disable_tp=self.ac922_tp3,
+             bias=False,
+             return_bias=False,
+             quant_config=fc_quant,
+@@ -467,6 +472,15 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         config = vllm_config.model_config.hf_text_config
++        self.ac922_tp3 = bool(
++            getattr(
++                vllm_config.model_config.hf_config, "ac922_tp3_head_replication", False
++            )
++        )
++        if self.ac922_tp3:
++            from .qwen3_5_tp3_heads import validate_tp3_head_config
++
++            validate_tp3_head_config(vllm_config.model_config.hf_config)
+         self.vllm_config = vllm_config
+         cache_config = vllm_config.cache_config
+         if cache_config.mamba_cache_mode == "all":
+@@ -525,6 +539,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+                     config.hidden_size,
+                     quant_config=self.quant_config,
+                     prefix=maybe_prefix(prefix, "lm_head"),
++                    **({"padding_size": 192} if self.ac922_tp3 else {}),
+                 )
+         else:
+             self.lm_head = PPMissingLayer()
+@@ -595,6 +610,11 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        if self.ac922_tp3:
++            from .qwen3_5_tp3_heads import replicate_tp3_mtp_weights
++
++            weights = replicate_tp3_mtp_weights(weights)
++
+         def remap_weight_names(weights):
+             for name, weight in weights:
+                 if name.startswith("mtp."):
+diff --git a/vllm/model_executor/models/qwen3_5_tp3_heads.py b/vllm/model_executor/models/qwen3_5_tp3_heads.py
+index c862ff12c..3023471a4 100644
+--- a/vllm/model_executor/models/qwen3_5_tp3_heads.py
++++ b/vllm/model_executor/models/qwen3_5_tp3_heads.py
+@@ -276,3 +276,40 @@ def replicate_tp3_heads(
+     missing_dense = expected_dense - seen_dense
+     if missing_dense:
+         raise ValueError(f"TP3 checkpoint is missing GDN tensors: {missing_dense}")
++
++
++def replicate_tp3_mtp_weights(
++    weights: Iterable[tuple[str, torch.Tensor]],
++) -> Iterator[tuple[str, torch.Tensor]]:
++    """Apply the target's exact full-attention/MLP surgery to MTP layer zero."""
++    prefix = "mtp.layers.0."
++    expected = {
++        "self_attn.q_proj.weight",
++        "self_attn.k_proj.weight",
++        "self_attn.v_proj.weight",
++        "self_attn.o_proj.weight",
++        "mlp.gate_proj.weight",
++        "mlp.up_proj.weight",
++        "mlp.down_proj.weight",
++    }
++    seen: set[str] = set()
++    for name, tensor in weights:
++        if not name.startswith(prefix):
++            yield name, tensor
++            continue
++        suffix = name[len(prefix) :]
++        if suffix not in expected:
++            yield name, tensor
++            continue
++        if suffix in seen:
++            raise ValueError(f"duplicate TP3 MTP tensor: {name}")
++        seen.add(suffix)
++        virtual_name = f"model.language_model.layers.0.{suffix}"
++        transformed = replicate_tp3_heads(
++            [(virtual_name, tensor)], ["full_attention"], require_complete=False
++        )
++        _, expanded = next(transformed)
++        yield name, expanded
++    missing = expected - seen
++    if missing:
++        raise ValueError(f"TP3 MTP checkpoint is missing tensors: {missing}")
+-- 
+2.50.1 (Apple Git-155)
+

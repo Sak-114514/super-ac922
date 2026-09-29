@@ -1,0 +1,20 @@
+[Unit]
+Description=AC922 Qwen3.8 coding API (DFlash2 TP3 FP8 GPU0/1/2)
+After=network.target
+Conflicts=ac922-coding-api-tp2.service
+StartLimitIntervalSec=600
+StartLimitBurst=2
+
+[Service]
+Type=simple
+WorkingDirectory=/home/debian/ac922-vllm
+ExecStartPre=/usr/bin/test -s /home/debian/ac922-vllm/runtime-tp3-dflash-20260929/site-packages/vllm/__init__.py
+ExecStart=/bin/sh /home/debian/ac922-vllm/start_coding_api_tp3_gpu012.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+StandardOutput=append:/home/debian/ac922-vllm/coding-api-tp3.log
+StandardError=append:/home/debian/ac922-vllm/coding-api-tp3.log
+
+[Install]
+WantedBy=default.target

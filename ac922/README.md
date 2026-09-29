@@ -64,6 +64,22 @@ decoding at 110 tok/s single stream (82.2% acceptance)**, and a **30-minute
 4-way concurrency run at ~180 tok/s aggregate with zero errors**. The patch,
 harnesses, per-request records, and the full report are included.
 
+## TP3 + native MTP4 trial and production switch (2026-09-29/30)
+
+[`tp3-mtp4-trial/`](tp3-mtp4-trial/README.md) is the sequel: the same fork
+drives the model's **native single-layer MTP head** instead of the DFlash2
+drafter. Three config-level blockers (the draft re-reading the raw
+checkpoint, a 5120-wide `fc` that cannot split by 3, `--hf-overrides` not
+reaching the draft) were fixed in four files with checkpoints untouched.
+The bounded trial measured **242,119 KV tokens, 69.69 tok/s at 64k,
+83.9% acceptance**; a three-tier utilization scan picked 0.91; and after a
+production-only CUDA-Graph surprise (1.13 GiB vs 0.37 in the trial) the
+service went to production at **0.88 with a 227,555-token KV pool** (2.3×
+the DFlash2 production pool), **69.74 tok/s** single-stream 64k decode and
+**116.30 tok/s** all-live decode at 4×50k. DFlash remains installed as a
+one-command rollback. Patches, harnesses, per-request records, and the full
+report are included.
+
 Operational pitfall records from the same campaign and earlier:
 
 - [`PITFALLS-FAN-THERMAL.md`](PITFALLS-FAN-THERMAL.md) — home-datacenter fan

@@ -1,7 +1,7 @@
 <!-- markdownlint-disable MD041 -->
 
 > 📖 **中文说明 / Chinese guide:** [README.zh-CN.md](README.zh-CN.md) —
-> AC922 POWER9/V100 构建快照、TP3+DFlash2 试验记录与踩坑笔记。
+> AC922 POWER9/V100 构建快照、TP3+DFlash2 / 原生 MTP4 试验记录与踩坑笔记。
 
 
 <p align="center">

@@ -1,0 +1,11 @@
+{
+  "elapsed_s": 4.2,
+  "completed_requests": 4,
+  "generated_tokens": 512,
+  "errors": [],
+  "max_running": 4,
+  "max_waiting": 0,
+  "samples_running_four": 2,
+  "samples_running_clients": 2,
+  "max_gpu_c": 41
+}

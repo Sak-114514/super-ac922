@@ -9,6 +9,7 @@
 | 内容 | 入口 |
 |---|---|
 | **TP3 + DFlash2 服务战役(2026-09-29)** | [ac922/tp3-dflash2-trial/README.md](ac922/tp3-dflash2-trial/README.md) |
+| **TP3 + 原生 MTP4 试车与生产切换(2026-09-29/30)** | [ac922/tp3-mtp4-trial/README.md](ac922/tp3-mtp4-trial/README.md) |
 | ppc64le 构建快照、依赖 wheel 清单 | [ac922/README.md](#ac922-ppc64le-构建快照中文版) |
 | 家用温控踩坑(风扇策略断电事故复盘) | [ac922/PITFALLS-FAN-THERMAL.md](ac922/PITFALLS-FAN-THERMAL.md) |
 | 低内存/内存管理踩坑(幽灵 DIMM、swap、图捕获头寸) | [ac922/PITFALLS-MEMORY-LOWMEM.md](ac922/PITFALLS-MEMORY-LOWMEM.md) |
@@ -530,6 +531,18 @@ Power 系统或发行版的可移植性。
 一致 20/20)、**DFlash2 投机解码单流 110 tok/s(接受率 82.2%)**、
 **四并发 30 分钟 ~180 tok/s 聚合零错误**。补丁、测试工具、逐条记录与完整
 报告一应俱全。
+
+### TP3 + 原生 MTP4 试车与生产切换(2026-09-29/30)
+
+[`tp3-mtp4-trial/`](tp3-mtp4-trial/README.md) 是续篇:同一个 fork 改用模型
+**原生单层 MTP 预测头**替换 DFlash2 drafter。三道配置级障碍(draft 重读
+原始 checkpoint、5120 宽 `fc` 无法三等分、`--hf-overrides` 传不进 draft)
+在四个文件内修复,checkpoint 零改动。隔离试车实测 **242,119 tokens KV 池、
+64k 单流 69.69 tok/s、接受率 83.9%**;三档利用率扫描选定 0.91;遭遇
+"生产 CUDA Graph 1.13 GiB ≠ 试车 0.37"后以 **0.88 上生产,KV 池
+227,555 tokens**(DFlash2 生产的 2.3 倍),单流 64k **69.74 tok/s**、
+4×50k 全场解码 **116.30 tok/s**。DFlash 保留一条命令即可回退。补丁、
+工具、逐条记录与完整过程记录一应俱全。
 
 同期与更早的运维踩坑记录:
 

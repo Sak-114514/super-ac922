@@ -1,0 +1,2 @@
+{"prompt_tokens":1000,"cache_salt":"ac922-tp3-1790693685169309807","generated_tokens":128,"stream_events":29,"first_chunk_tokens":1,"ttft_s":0.653,"prefill_tps":1531.94,"decode_s":2.064,"decode_tps_after_first_token":61.52,"decode_tps_after_first_chunk":61.52,"total_s":2.717}
+{"prompt_tokens":64000,"cache_salt":"ac922-tp3-1790693687922283193","generated_tokens":128,"stream_events":32,"first_chunk_tokens":1,"ttft_s":35.693,"prefill_tps":1793.05,"decode_s":1.822,"decode_tps_after_first_token":69.69,"decode_tps_after_first_chunk":69.69,"total_s":37.516}

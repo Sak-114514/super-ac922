@@ -1,0 +1,4 @@
+{"worker":1,"iteration":0,"generated_tokens":128,"elapsed_s":3.069}
+{"worker":3,"iteration":0,"generated_tokens":128,"elapsed_s":3.124}
+{"worker":2,"iteration":0,"generated_tokens":128,"elapsed_s":3.424}
+{"worker":0,"iteration":0,"generated_tokens":128,"elapsed_s":4.175}

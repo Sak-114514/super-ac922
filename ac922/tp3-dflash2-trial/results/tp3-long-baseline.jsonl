@@ -1,0 +1,2 @@
+{"label": "p100k", "prompt_tokens": 100000, "ttft_s": 62.15, "prefill_tps": 1609.0, "decode_tokens": 125, "decode_s": 4.16, "decode_tps": 30.05, "total_s": 66.31}
+{"label": "p199k", "prompt_tokens": 199000, "ttft_s": 167.47, "prefill_tps": 1188.2, "decode_tokens": 123, "decode_s": 4.98, "decode_tps": 24.71, "total_s": 172.45}

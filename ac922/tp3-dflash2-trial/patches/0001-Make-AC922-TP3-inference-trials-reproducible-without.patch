@@ -1,0 +1,1945 @@
+From 73c19ec89df9c90070ca0a53fa9378bb93c87c46 Mon Sep 17 00:00:00 2001
+From: Sak-114514 <Sak-114514@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 19:57:09 +0800
+Subject: [PATCH] Make AC922 TP3 inference trials reproducible without
+ rewriting model files
+
+The Qwen3.8 checkpoint has KV, GDN, MLP, and vocabulary dimensions that
+cannot be divided directly across three V100s. Opt-in load-time head
+replication, output-scale balancing, and zero padding preserve the source
+weights while allowing the existing tensor-parallel loaders to run. The
+DFlash2 drafter also needs an opt-in TP3 expansion because this fork builds
+its draft with the target TP group despite accepting a TP1 draft setting.
+
+The isolated launcher and tests keep the current installed runtime separate
+from these trials. The DFlash KV planner uses a bounded common page and a
+five-group layout to admit four simultaneous short requests.
+
+Constraint: POWER9, three 16GB V100s, CUDA 12.4, and fork db292f9a4
+Constraint: Original checkpoint files and production runtime package remain unchanged
+Rejected: Draft TP1 config alone | model construction still uses the target TP3 group
+Rejected: Draft FP8 KV as a capacity fix | draft scales are unverified and the common page does not halve
+Confidence: medium
+Scope-risk: moderate
+Reversibility: clean
+Directive: Preserve the explicit opt-in flags and the shared source-and-copy half scaling; do not infer bitwise equality from greedy parity
+Tested: Seven unit and real-checkpoint checks; Ruff and shell syntax; targeted mypy; 20/20 TP2-vs-TP3 greedy outputs; 100k and 199k prefill/decode; DFlash acceptance and token-counted throughput; 1803s four-way run with 1265 successful requests and max Running=4 Waiting=0
+Not-tested: Four simultaneous full-64k contexts; DFlash at 200k (rejected by measured KV budget); production switchover; full-project mypy and CI suite
+---
+ tests/models/qwen3_5/check_tp3_config.py      |  66 ++++
+ tests/models/qwen3_5/test_dflash_tp3_heads.py |  80 +++++
+ .../models/qwen3_5/test_tp3_dflash_kv_page.py |  92 +++++
+ .../qwen3_5/test_tp3_head_replication.py      | 325 ++++++++++++++++++
+ tools/ac922/README.md                         |  85 +++++
+ tools/ac922/bench_stream_token_ids.py         |  99 ++++++
+ tools/ac922/compare_greedy_tp2_tp3.py         | 128 +++++++
+ tools/ac922/serve_tp3_trial.sh                |  61 ++++
+ tools/ac922/stability_tp3.py                  | 196 +++++++++++
+ vllm/config/speculative.py                    |  26 ++
+ vllm/model_executor/models/qwen3_5.py         |  46 ++-
+ .../models/qwen3_5_tp3_heads.py               | 278 +++++++++++++++
+ vllm/model_executor/models/qwen3_dflash.py    |  18 +
+ .../models/qwen3_dflash_tp3_heads.py          |  85 +++++
+ vllm/v1/core/kv_cache_utils.py                |  48 ++-
+ .../gpu/spec_decode/dflash2/speculator.py     |  12 +-
+ 16 files changed, 1626 insertions(+), 19 deletions(-)
+ create mode 100644 tests/models/qwen3_5/check_tp3_config.py
+ create mode 100644 tests/models/qwen3_5/test_dflash_tp3_heads.py
+ create mode 100644 tests/models/qwen3_5/test_tp3_dflash_kv_page.py
+ create mode 100644 tests/models/qwen3_5/test_tp3_head_replication.py
+ create mode 100644 tools/ac922/README.md
+ create mode 100755 tools/ac922/bench_stream_token_ids.py
+ create mode 100755 tools/ac922/compare_greedy_tp2_tp3.py
+ create mode 100755 tools/ac922/serve_tp3_trial.sh
+ create mode 100755 tools/ac922/stability_tp3.py
+ create mode 100644 vllm/model_executor/models/qwen3_5_tp3_heads.py
+ create mode 100644 vllm/model_executor/models/qwen3_dflash_tp3_heads.py
+
+diff --git a/tests/models/qwen3_5/check_tp3_config.py b/tests/models/qwen3_5/check_tp3_config.py
+new file mode 100644
+index 000000000..9ef5b4922
+--- /dev/null
++++ b/tests/models/qwen3_5/check_tp3_config.py
+@@ -0,0 +1,66 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Configuration-only smoke for the AC922 TP3 trial (does not load weights)."""
++
++import os
++import sys
++
++from vllm.engine.arg_utils import EngineArgs
++from vllm.model_executor.models.qwen3_5_tp3_heads import validate_tp3_head_config
++
++
++def main(model: str, draft: str | None = None) -> None:
++    overrides = {
++        "ac922_tp3_head_replication": True,
++        "text_config": {
++            "num_attention_heads": 36,
++            "num_key_value_heads": 6,
++            "linear_num_key_heads": 18,
++            "linear_num_value_heads": 54,
++            "intermediate_size": 17664,
++        },
++    }
++    speculative = (
++        {
++            "method": "dflash",
++            "model": draft,
++            "num_speculative_tokens": int(os.environ.get("AC922_DFLASH_DEPTH", "7")),
++            "draft_tensor_parallel_size": 3,
++            "draft_sample_method": "probabilistic",
++            "kv_cache_dtype": "auto",
++        }
++        if draft is not None
++        else None
++    )
++    args = EngineArgs(
++        model=model,
++        tensor_parallel_size=3,
++        quantization="compressed-tensors",
++        dtype="float16",
++        max_model_len=200000,
++        max_num_seqs=4,
++        max_num_batched_tokens=4096,
++        gpu_memory_utilization=0.95,
++        limit_mm_per_prompt={"image": 0, "video": 0},
++        hf_overrides=overrides,
++        speculative_config=speculative,
++    )
++    config = args.create_engine_config()
++    assert config.parallel_config.tensor_parallel_size == 3
++    assert config.model_config.hf_config.ac922_tp3_head_replication
++    validate_tp3_head_config(config.model_config.hf_config)
++    print("PASS TP3 config: 36 Q / 6 KV / 18 GDN key / 54 GDN value")
++    if draft is not None:
++        assert config.speculative_config is not None
++        draft_config = config.speculative_config.draft_model_config.hf_config
++        assert draft_config.ac922_tp3_draft_replication
++        assert (draft_config.num_attention_heads, draft_config.num_key_value_heads) == (
++            36,
++            9,
++        )
++        print(f"PASS speculative config: {config.speculative_config.method}")
++
++
++if __name__ == "__main__":
++    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+diff --git a/tests/models/qwen3_5/test_dflash_tp3_heads.py b/tests/models/qwen3_5/test_dflash_tp3_heads.py
+new file mode 100644
+index 000000000..8f6e81b86
+--- /dev/null
++++ b/tests/models/qwen3_5/test_dflash_tp3_heads.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++import torch
++
++from vllm.model_executor.models.qwen3_dflash_tp3_heads import (
++    replicate_dflash_tp3_weights,
++    validate_dflash_tp3_config,
++)
++
++
++def test_draft_config_and_missing_tensors():
++    config = SimpleNamespace(
++        num_attention_heads=36,
++        num_key_value_heads=9,
++        head_dim=128,
++        intermediate_size=17664,
++        hidden_size=5120,
++        vocab_size=248320,
++        num_hidden_layers=5,
++    )
++    validate_dflash_tp3_config(config)
++    config.num_key_value_heads = 8
++    with unittest.TestCase().assertRaisesRegex(ValueError, "num_key_value_heads=9"):
++        validate_dflash_tp3_config(config)
++    with unittest.TestCase().assertRaisesRegex(ValueError, "missing draft tensors"):
++        list(replicate_dflash_tp3_weights([]))
++
++
++def test_real_draft_attention_replication():
++    from safetensors import safe_open
++
++    if not (model_path := os.environ.get("AC922_DFLASH_TP3_TEST_MODEL")):
++        raise unittest.SkipTest("set AC922_DFLASH_TP3_TEST_MODEL")
++    prefix = "layers.0.self_attn"
++    names = [
++        f"{prefix}.{projection}.weight"
++        for projection in ("q_proj", "k_proj", "v_proj", "o_proj")
++    ]
++    with safe_open(
++        str(Path(model_path) / "model.safetensors"), framework="pt", device="cpu"
++    ) as handle:
++        weights = {name: handle.get_tensor(name) for name in names}
++    expanded = dict(
++        replicate_dflash_tp3_weights(weights.items(), require_complete=False)
++    )
++    q = weights[f"{prefix}.q_proj.weight"]
++    new_q = expanded[f"{prefix}.q_proj.weight"]
++    o = weights[f"{prefix}.o_proj.weight"]
++    new_o = expanded[f"{prefix}.o_proj.weight"]
++    assert new_q.shape == (4608, 5120)
++    assert new_o.shape == (5120, 4608)
++    assert torch.equal(new_q[4096:], q[:512])
++    assert torch.equal(new_o[:, :512] * 2, o[:, :512])
++    assert torch.equal(new_o[:, 512:4096], o[:, 512:])
++    assert torch.equal(new_o[:, 4096:], new_o[:, :512])
++    for projection in ("k_proj", "v_proj"):
++        old = weights[f"{prefix}.{projection}.weight"]
++        new = expanded[f"{prefix}.{projection}.weight"]
++        assert new.shape == (1152, 5120)
++        assert torch.equal(new[1024:], old[:128])
++
++    torch.manual_seed(13)
++    hidden = torch.randn(5120, dtype=torch.float64)
++    original_output = o.double() @ (q.double() @ hidden)
++    expanded_output = new_o.double() @ (new_q.double() @ hidden)
++    torch.testing.assert_close(expanded_output, original_output, rtol=0, atol=1e-8)
++
++
++if __name__ == "__main__":
++    test_draft_config_and_missing_tensors()
++    print("PASS test_draft_config_and_missing_tensors")
++    if os.environ.get("AC922_DFLASH_TP3_TEST_MODEL"):
++        test_real_draft_attention_replication()
++        print("PASS test_real_draft_attention_replication")
+diff --git a/tests/models/qwen3_5/test_tp3_dflash_kv_page.py b/tests/models/qwen3_5/test_tp3_dflash_kv_page.py
+new file mode 100644
+index 000000000..8012b2a93
+--- /dev/null
++++ b/tests/models/qwen3_5/test_tp3_dflash_kv_page.py
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import math
++import unittest
++from types import SimpleNamespace
++
++import torch
++
++from vllm.v1.core.kv_cache_utils import (
++    _get_kv_cache_groups_uniform_page_size,
++    unify_kv_cache_spec_page_size,
++)
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    MambaSpec,
++    SlidingWindowSpec,
++)
++
++
++def test_tp3_dflash_uses_bounded_common_kv_page():
++    target = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=2,
++        head_size=256,
++        dtype=torch.float8_e4m3fn,
++    )
++    draft = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=3,
++        head_size=128,
++        dtype=torch.float16,
++    )
++    specs = {"target": target, "draft": draft}
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            draft_model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(ac922_tp3_draft_replication=True)
++            )
++        )
++    )
++    unified = unify_kv_cache_spec_page_size(specs, config)
++    common_page = math.lcm(target.page_size_bytes, draft.page_size_bytes)
++    assert all(spec.page_size_bytes == common_page for spec in unified.values())
++    assert unified["target"].block_size == 48
++    assert unified["draft"].block_size == 32
++    with unittest.TestCase().assertRaises(NotImplementedError):
++        unify_kv_cache_spec_page_size(specs, SimpleNamespace(speculative_config=None))
++
++
++def test_tp3_dflash_groups_have_fewer_fixed_request_blocks():
++    target = FullAttentionSpec(
++        block_size=48,
++        num_kv_heads=2,
++        head_size=256,
++        dtype=torch.float8_e4m3fn,
++    )
++    draft = SlidingWindowSpec(
++        block_size=32,
++        num_kv_heads=3,
++        head_size=128,
++        dtype=torch.float16,
++        sliding_window=2048,
++    )
++    mamba = MambaSpec(
++        block_size=48,
++        shapes=((12288,),),
++        dtypes=(torch.float32,),
++        page_size_padded=target.page_size_bytes,
++    )
++    assert target.page_size_bytes == draft.page_size_bytes == mamba.page_size_bytes
++    specs = {
++        **{f"draft.{i}": draft for i in range(5)},
++        **{f"target.{i}": target for i in range(16)},
++        **{f"mamba.{i}": mamba for i in range(48)},
++    }
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            draft_model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(ac922_tp3_draft_replication=True)
++            )
++        )
++    )
++    assert len(_get_kv_cache_groups_uniform_page_size(specs)) == 9
++    assert len(_get_kv_cache_groups_uniform_page_size(specs, config)) == 5
++
++
++if __name__ == "__main__":
++    test_tp3_dflash_uses_bounded_common_kv_page()
++    print("PASS test_tp3_dflash_uses_bounded_common_kv_page")
++    test_tp3_dflash_groups_have_fewer_fixed_request_blocks()
++    print("PASS test_tp3_dflash_groups_have_fewer_fixed_request_blocks")
+diff --git a/tests/models/qwen3_5/test_tp3_head_replication.py b/tests/models/qwen3_5/test_tp3_head_replication.py
+new file mode 100644
+index 000000000..6465b1dc5
+--- /dev/null
++++ b/tests/models/qwen3_5/test_tp3_head_replication.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++from vllm.model_executor.models.qwen3_5_tp3_heads import (
++    _pad_mlp_input,
++    _pad_mlp_output,
++    _repeat_input,
++    _repeat_output,
++    replicate_tp3_heads,
++    validate_tp3_head_config,
++)
++
++
++def test_attention_gate_and_output_are_equivalent_after_replication():
++    torch.manual_seed(7)
++    q_gate = torch.randn(8, 3, dtype=torch.float64)
++    out = torch.randn(3, 4, dtype=torch.float64)
++    hidden = torch.randn(3, dtype=torch.float64)
++
++    def heads(weight):
++        q, gate = (weight @ hidden).reshape(-1, 2, 2).unbind(-2)
++        return (q * torch.sigmoid(gate)).flatten()
++
++    expanded_q_gate = _repeat_output(q_gate, "weight", 3, ((8, 4),))
++    expanded_out = _repeat_input(out, "weight", 3, 4, 2)
++    torch.testing.assert_close(
++        expanded_out @ heads(expanded_q_gate),
++        out @ heads(q_gate),
++        rtol=0,
++        atol=1e-12,
++    )
++
++
++def test_packed_int4_input_replication_preserves_dequantized_output():
++    torch.manual_seed(11)
++    codes = torch.randint(0, 16, (8, 256), dtype=torch.int32)
++    zero_codes = torch.randint(0, 16, (8, 2), dtype=torch.int32)
++    packed = torch.zeros((8, 32), dtype=torch.int32)
++    zero_packed = torch.zeros((1, 2), dtype=torch.int32)
++    for nibble in range(8):
++        packed |= codes[:, nibble::8] << (4 * nibble)
++        zero_packed[0] |= zero_codes[nibble] << (4 * nibble)
++    scales = torch.tensor([[0.125, 0.25], [0.5, 0.0625]] * 4, dtype=torch.bfloat16)
++
++    def dequant(weight, scale, zero):
++        unpacked = torch.stack(
++            [((weight >> (4 * i)) & 15) for i in range(8)], dim=-1
++        ).reshape(8, -1)
++        zero_unpacked = torch.stack(
++            [((zero[0] >> (4 * i)) & 15) for i in range(8)], dim=0
++        )
++        return (unpacked - zero_unpacked.repeat_interleave(128, dim=1)) * scale.to(
++            torch.float64
++        ).repeat_interleave(128, dim=1)
++
++    new_packed = _repeat_input(packed, "weight_packed", 8, 256, 128)
++    new_scales = _repeat_input(scales, "weight_scale", 8, 256, 128)
++    new_zero = _repeat_input(zero_packed, "weight_zero_point", 8, 256, 128)
++    inputs = torch.randn(256, dtype=torch.float64)
++    expanded_inputs = torch.cat((inputs, inputs[:128]))
++    torch.testing.assert_close(
++        dequant(new_packed, new_scales, new_zero) @ expanded_inputs,
++        dequant(packed, scales, zero_packed) @ inputs,
++        rtol=0,
++        atol=1e-12,
++    )
++
++
++def test_checkpoint_shape_dispatch_and_missing_projection_guard():
++    layer_types = [
++        "full_attention" if layer % 4 == 3 else "linear_attention"
++        for layer in range(64)
++    ]
++    shapes = []
++    for layer, kind in enumerate(layer_types):
++        if kind == "full_attention":
++            projections = {
++                "q_proj": (12288, 5120),
++                "k_proj": (1024, 5120),
++                "v_proj": (1024, 5120),
++                "o_proj": (5120, 6144),
++            }
++            branch = "self_attn"
++        else:
++            projections = {
++                "in_proj_qkv": (10240, 5120),
++                "in_proj_z": (6144, 5120),
++                "out_proj": (5120, 6144),
++            }
++            branch = "linear_attn"
++        for projection, shape in projections.items():
++            name = (
++                f"model.language_model.layers.{layer}.{branch}."
++                f"{projection}.weight_shape"
++            )
++            shapes.append((name, torch.tensor(shape)))
++
++    expanded = dict(replicate_tp3_heads(shapes, layer_types, require_complete=False))
++    assert expanded[shapes[0][0]].tolist() == [11520, 5120]
++    full_q = "model.language_model.layers.3.self_attn.q_proj.weight_shape"
++    assert expanded[full_q].tolist() == [18432, 5120]
++    full_out = "model.language_model.layers.3.self_attn.o_proj.weight_shape"
++    assert expanded[full_out].tolist() == [5120, 9216]
++    with unittest.TestCase().assertRaisesRegex(
++        ValueError, "missing packed projections"
++    ):
++        list(replicate_tp3_heads(shapes[:-1], layer_types))
++
++
++def test_missing_dense_gdn_tensor_fails_closed():
++    prefix = "model.language_model.layers.0.linear_attn"
++    shapes = (
++        ("in_proj_qkv", (10240, 5120)),
++        ("in_proj_z", (6144, 5120)),
++        ("out_proj", (5120, 6144)),
++    )
++    weights = [
++        (f"{prefix}.{projection}.weight_shape", torch.tensor(shape))
++        for projection, shape in shapes
++    ]
++    mlp_prefix = "model.language_model.layers.0.mlp"
++    weights.extend(
++        (f"{mlp_prefix}.{projection}.weight_shape", torch.tensor(shape))
++        for projection, shape in (
++            ("gate_proj", (17408, 5120)),
++            ("up_proj", (17408, 5120)),
++            ("down_proj", (5120, 17408)),
++        )
++    )
++    with unittest.TestCase().assertRaisesRegex(ValueError, "missing GDN tensors"):
++        list(replicate_tp3_heads(weights, ["linear_attention"]))
++    bad = [(f"{prefix}.in_proj_a.weight", torch.zeros(48, 1))]
++    with unittest.TestCase().assertRaisesRegex(ValueError, "unexpected dense shape"):
++        list(replicate_tp3_heads(bad, ["linear_attention"], require_complete=False))
++
++
++def test_mlp_padding_adds_only_zero_neurons_and_zero_input_weights():
++    gate_scale = torch.full((17408, 40), 0.25, dtype=torch.bfloat16)
++    down_scale = torch.full((5120, 136), 0.125, dtype=torch.bfloat16)
++    new_gate = _pad_mlp_output(gate_scale, "weight_scale")
++    new_down = _pad_mlp_input(down_scale, "weight_scale")
++    assert new_gate.shape == (17664, 40)
++    assert new_down.shape == (5120, 138)
++    assert torch.equal(new_gate[:17408], gate_scale)
++    assert torch.all(new_gate[17408:] == 1)
++    assert torch.equal(new_down[:, :136], down_scale)
++    assert torch.all(new_down[:, 136:] == 1)
++    assert _pad_mlp_output(torch.tensor([17408, 5120]), "weight_shape").tolist() == [
++        17664,
++        5120,
++    ]
++    assert _pad_mlp_input(torch.tensor([5120, 17408]), "weight_shape").tolist() == [
++        5120,
++        17664,
++    ]
++
++
++def test_top_level_model_loader_applies_replication_before_mapping():
++    import vllm.model_executor.models.qwen3_5 as qwen35
++
++    text = SimpleNamespace(
++        num_attention_heads=36,
++        num_key_value_heads=6,
++        head_dim=256,
++        linear_num_key_heads=18,
++        linear_num_value_heads=54,
++        linear_key_head_dim=128,
++        linear_value_head_dim=128,
++        hidden_size=5120,
++        intermediate_size=17664,
++        attn_output_gate=True,
++        layer_types=[
++            "full_attention" if layer % 4 == 3 else "linear_attention"
++            for layer in range(64)
++        ],
++    )
++    model = qwen35.Qwen3_5ForConditionalGeneration.__new__(
++        qwen35.Qwen3_5ForConditionalGeneration
++    )
++    torch.nn.Module.__init__(model)
++    model.config = SimpleNamespace(ac922_tp3_head_replication=True, text_config=text)
++
++    def check_loader(weights, mapper):
++        assert mapper is model.hf_to_vllm_mapper
++        name, shape = next(iter(weights))
++        assert name == "model.language_model.layers.3.self_attn.q_proj.weight_shape"
++        assert shape.tolist() == [18432, 5120]
++        return {"head-replication-applied"}
++
++    with patch.object(qwen35, "AutoWeightsLoader") as loader:
++        loader.return_value.load_weights.side_effect = check_loader
++        result = model.load_weights(
++            [
++                (
++                    "model.language_model.layers.3.self_attn.q_proj.weight_shape",
++                    torch.tensor([12288, 5120]),
++                )
++            ]
++        )
++    assert result == {"head-replication-applied"}
++
++
++def test_config_requires_exact_target_head_layout():
++    text = SimpleNamespace(
++        num_attention_heads=36,
++        num_key_value_heads=6,
++        head_dim=256,
++        linear_num_key_heads=18,
++        linear_num_value_heads=54,
++        linear_key_head_dim=128,
++        linear_value_head_dim=128,
++        hidden_size=5120,
++        intermediate_size=17664,
++        attn_output_gate=True,
++        layer_types=[
++            "full_attention" if layer % 4 == 3 else "linear_attention"
++            for layer in range(64)
++        ],
++    )
++    assert len(validate_tp3_head_config(SimpleNamespace(text_config=text))) == 64
++    text.num_key_value_heads = 4
++    with unittest.TestCase().assertRaisesRegex(ValueError, "num_key_value_heads=6"):
++        validate_tp3_head_config(SimpleNamespace(text_config=text))
++
++
++def test_real_checkpoint_sample_without_full_weight_scan():
++    import json
++    from collections import defaultdict
++    from pathlib import Path
++
++    from safetensors import safe_open
++
++    if not (model_path := os.environ.get("AC922_TP3_TEST_MODEL")):
++        raise unittest.SkipTest("set AC922_TP3_TEST_MODEL for the real checkpoint")
++    model = Path(model_path)
++    config = json.loads((model / "config.json").read_text())
++    layer_types = config["text_config"]["layer_types"]
++    index = json.loads((model / "model.safetensors.index.json").read_text())
++    weight_map = index["weight_map"]
++    wanted = set()
++    for layer, kind in enumerate(layer_types):
++        branch = "self_attn" if kind == "full_attention" else "linear_attn"
++        projections = (
++            ("q_proj", "k_proj", "v_proj", "o_proj")
++            if kind == "full_attention"
++            else ("in_proj_qkv", "in_proj_z", "out_proj")
++        )
++        for projection in projections:
++            wanted.add(
++                f"model.language_model.layers.{layer}.{branch}."
++                f"{projection}.weight_shape"
++            )
++    assert len(wanted) == 208
++    q_prefix = "model.language_model.layers.3.self_attn.q_proj"
++    gdn_prefix = "model.language_model.layers.0.linear_attn.out_proj"
++    mlp_prefix = "model.language_model.layers.0.mlp"
++    samples = {
++        f"{q_prefix}.weight_packed",
++        f"{q_prefix}.weight_zero_point",
++        f"{gdn_prefix}.weight_scale",
++        f"{gdn_prefix}.weight_zero_point",
++        f"{mlp_prefix}.gate_proj.weight_scale",
++        f"{mlp_prefix}.down_proj.weight_scale",
++        f"{mlp_prefix}.gate_proj.weight_shape",
++        f"{mlp_prefix}.down_proj.weight_shape",
++    }
++    by_file = defaultdict(list)
++    for name in wanted | samples:
++        by_file[weight_map[name]].append(name)
++    weights = {}
++    for shard, names in by_file.items():
++        with safe_open(str(model / shard), framework="pt", device="cpu") as handle:
++            for name in names:
++                weights[name] = handle.get_tensor(name)
++
++    expanded = dict(
++        replicate_tp3_heads(weights.items(), layer_types, require_complete=False)
++    )
++    packed = weights[f"{q_prefix}.weight_packed"]
++    assert expanded[f"{q_prefix}.weight_packed"].shape == (18432, 640)
++    assert torch.equal(expanded[f"{q_prefix}.weight_packed"][12288:], packed[:6144])
++    zero = weights[f"{q_prefix}.weight_zero_point"]
++    assert torch.equal(expanded[f"{q_prefix}.weight_zero_point"][1536:], zero[:768])
++    scale = weights[f"{gdn_prefix}.weight_scale"]
++    new_scale = expanded[f"{gdn_prefix}.weight_scale"]
++    assert new_scale.shape == (5120, 54)
++    assert torch.equal(new_scale[:, :6] * 2, scale[:, :6])
++    assert torch.equal(new_scale[:, 6:48], scale[:, 6:])
++    assert torch.equal(new_scale[:, 48:], new_scale[:, :6])
++    zero = weights[f"{gdn_prefix}.weight_zero_point"]
++    assert torch.equal(expanded[f"{gdn_prefix}.weight_zero_point"][:, 48:], zero[:, :6])
++    assert expanded[f"{mlp_prefix}.gate_proj.weight_shape"].tolist() == [
++        17664,
++        5120,
++    ]
++    assert expanded[f"{mlp_prefix}.down_proj.weight_shape"].tolist() == [
++        5120,
++        17664,
++    ]
++    assert torch.all(expanded[f"{mlp_prefix}.gate_proj.weight_scale"][17408:] == 1)
++    assert torch.all(expanded[f"{mlp_prefix}.down_proj.weight_scale"][:, 136:] == 1)
++
++
++if __name__ == "__main__":
++    for test in (
++        test_attention_gate_and_output_are_equivalent_after_replication,
++        test_packed_int4_input_replication_preserves_dequantized_output,
++        test_checkpoint_shape_dispatch_and_missing_projection_guard,
++        test_missing_dense_gdn_tensor_fails_closed,
++        test_mlp_padding_adds_only_zero_neurons_and_zero_input_weights,
++        test_top_level_model_loader_applies_replication_before_mapping,
++        test_config_requires_exact_target_head_layout,
++    ):
++        test()
++        print(f"PASS {test.__name__}")
++    if os.environ.get("AC922_TP3_TEST_MODEL"):
++        test_real_checkpoint_sample_without_full_weight_scan()
++        print("PASS test_real_checkpoint_sample_without_full_weight_scan")
+diff --git a/tools/ac922/README.md b/tools/ac922/README.md
+new file mode 100644
+index 000000000..445bf4c11
+--- /dev/null
++++ b/tools/ac922/README.md
+@@ -0,0 +1,85 @@
++# AC922 TP3 head replication and DFlash2 trial
++
++This branch starts from `db292f9a4` of the 1Cat fork. It targets the local
++Qwen3.8-27B AWQ checkpoint with 24 Q / 4 KV attention heads, 16 full-attention
++layers, 48 GDN layers, and 17408-wide MLPs. The original checkpoint files are
++read without rewriting them. The code is opt-in through `--hf-overrides` and
++an isolated runtime package.
++
++## Why the loader changes are specific to this checkpoint
++
++- The attention Q projection also contains output gates: each Q head occupies
++  512 rows. Shared q/k norms and the GDN norm are left alone.
++- GDN b/a, `A_log`, and `dt_bias` belong to value heads. Two copied key heads
++  require six copied value heads and their recurrence parameters.
++- Int4 weights pack eight input channels per int32. Zero points pack eight
++  output channels per int32. Output-projection source and copied scale groups
++  are both halved, preserving their combined contribution.
++- MLP width 17408 does not divide by three. Adding 256 zero neurons gives
++  17664, or 5888 channels per GPU. The 248320 vocabulary keeps its logical
++  size while its internal embedding and LM-head padding uses a 192-row unit.
++- The DFlash2 draft checkpoint has 32 Q / 8 KV heads. This fork's DFlash
++  loader still constructs the draft with the target TP group even when
++  `draft_tensor_parallel_size=1` parses successfully. The opt-in draft path
++  copies one KV group and its four Q heads to form 36 Q / 9 KV, and zero-pads
++  its MLP. The draft embedding and LM head are shared with the target.
++
++## Isolated host staging
++
++Run from a checkout of this branch **on the AC922**. Adjust the two source
++paths if they differ. This creates a separate RAM copy of only the `vllm`
++package and symlinks the unchanged Python dependencies; it does not edit the
++installed production runtime.
++
++```sh
++source_root=$PWD
++runtime=/home/debian/ac922-vllm/runtime-525-20260928
++stage=/dev/shm/ac922-tp3
++mkdir -p "$stage/site-packages"
++for package in "$runtime"/site-packages/*; do
++    ln -s "$package" "$stage/site-packages/${package##*/}"
++done
++unlink "$stage/site-packages/vllm"
++cp -a "$runtime/site-packages/vllm" "$stage/site-packages/vllm"
++for file in \
++    vllm/config/speculative.py \
++    vllm/model_executor/models/qwen3_5.py \
++    vllm/model_executor/models/qwen3_5_tp3_heads.py \
++    vllm/model_executor/models/qwen3_dflash.py \
++    vllm/model_executor/models/qwen3_dflash_tp3_heads.py \
++    vllm/v1/core/kv_cache_utils.py \
++    vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py; do
++    install -m 644 "$source_root/$file" "$stage/site-packages/$file"
++done
++```
++
++The staging directory should be new. Use the existing wrapper
++`/home/debian/ac922-vllm/run_1cat_525.sh` with
++`AC922_RUN_ROOT=$stage`, `AC922_VLLM_SITE=$stage/site-packages`, and
++`AC922_RUNTIME_ROOT=$runtime`. `serve_tp3_trial.sh` sets those values by
++default for this machine.
++
++## Trial modes
++
++Use GPUs 0/1/2 after confirming they are available. Both modes bind
++`127.0.0.1:8003` and disable vLLM custom allreduce on V100.
++
++```sh
++sh tools/ac922/serve_tp3_trial.sh baseline
++sh tools/ac922/serve_tp3_trial.sh dflash
++```
++
++The baseline defaults to a 200k window and 0.90 GPU utilization. The DFlash2
++mode defaults to a 64k window, depth 3, 0.93 utilization, and four schedulable
++requests. Override with `AC922_MAX_MODEL_LEN`, `AC922_DFLASH_DEPTH`, or
++`AC922_GPU_MEMORY_UTILIZATION` for experiments. Depth 7 achieved higher
++single-stream decode speed, while the measured four-way configuration uses
++depth 3 and a five-group KV layout. Four simultaneous full-64k requests do
++not fit in the measured KV pool.
++
++`compare_greedy_tp2_tp3.py` captures and compares deterministic output token
++IDs. `bench_stream_token_ids.py` counts token IDs inside streamed chunks;
++counting SSE messages understates speculative decode throughput.
++`stability_tp3.py` logs completed requests, scheduler Running/Waiting, and
++GPU temperatures. Test results for this AC922 are in the companion
++`ac922-vllm/bench-results/2026-09-29-tp3/REPORT.md` workspace artifact.
+diff --git a/tools/ac922/bench_stream_token_ids.py b/tools/ac922/bench_stream_token_ids.py
+new file mode 100755
+index 000000000..fe999dc87
+--- /dev/null
++++ b/tools/ac922/bench_stream_token_ids.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Measure streamed token IDs, including multi-token speculative chunks."""
++
++import argparse
++import json
++import random
++import time
++from pathlib import Path
++from urllib.request import Request, urlopen
++
++
++def run(url: str, model: str, length: int, max_tokens: int) -> dict:
++    generator = random.Random(length)
++    prompt = [generator.randrange(5000, 150000) for _ in range(length)]
++    cache_salt = f"ac922-tp3-{time.time_ns()}"
++    body = {
++        "model": model,
++        "prompt": prompt,
++        "max_tokens": max_tokens,
++        "min_tokens": max_tokens,
++        "temperature": 0.0,
++        "stream": True,
++        "ignore_eos": True,
++        "return_token_ids": True,
++        "cache_salt": cache_salt,
++    }
++    request = Request(
++        url,
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++    )
++    started = time.monotonic()
++    ttft = None
++    first_chunk_tokens = 0
++    generated_tokens = 0
++    stream_events = 0
++    with urlopen(request, timeout=900) as response:
++        for line in response:
++            if not line.startswith(b"data:"):
++                continue
++            data = line[5:].strip()
++            if data == b"[DONE]":
++                continue
++            event = json.loads(data)
++            choices = event.get("choices") or []
++            if not choices:
++                continue
++            token_ids = choices[0].get("token_ids") or []
++            if not token_ids:
++                continue
++            if ttft is None:
++                ttft = time.monotonic() - started
++                first_chunk_tokens = len(token_ids)
++            generated_tokens += len(token_ids)
++            stream_events += 1
++    total = time.monotonic() - started
++    if ttft is None or generated_tokens != max_tokens:
++        raise ValueError(f"incomplete stream: ttft={ttft}, tokens={generated_tokens}")
++    decode_seconds = total - ttft
++    return {
++        "prompt_tokens": length,
++        "cache_salt": cache_salt,
++        "generated_tokens": generated_tokens,
++        "stream_events": stream_events,
++        "first_chunk_tokens": first_chunk_tokens,
++        "ttft_s": round(ttft, 3),
++        "prefill_tps": round(length / ttft, 2),
++        "decode_s": round(decode_seconds, 3),
++        "decode_tps_after_first_token": round(
++            (generated_tokens - 1) / decode_seconds, 2
++        ),
++        "decode_tps_after_first_chunk": round(
++            (generated_tokens - first_chunk_tokens) / decode_seconds, 2
++        ),
++        "total_s": round(total, 3),
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("url")
++    parser.add_argument("output", type=Path)
++    parser.add_argument("lengths", help="Comma-separated prompt lengths")
++    parser.add_argument("--max-tokens", type=int, default=128)
++    parser.add_argument("--model", default="qwen3.8-27b-ac922")
++    args = parser.parse_args()
++    if args.output.exists():
++        raise FileExistsError(args.output)
++    for length in (int(value) for value in args.lengths.split(",")):
++        record = run(args.url, args.model, length, args.max_tokens)
++        print(json.dumps(record), flush=True)
++        with args.output.open("a") as output:
++            output.write(json.dumps(record, separators=(",", ":")) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/ac922/compare_greedy_tp2_tp3.py b/tools/ac922/compare_greedy_tp2_tp3.py
+new file mode 100755
+index 000000000..e4a7fecbe
+--- /dev/null
++++ b/tools/ac922/compare_greedy_tp2_tp3.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Capture deterministic TP2 outputs and compare them with a TP3 trial."""
++
++import argparse
++import hashlib
++import json
++import random
++import time
++from pathlib import Path
++from urllib.request import Request, urlopen
++
++CASES = (
++    [(1000, seed) for seed in range(7)]
++    + [(8000, seed) for seed in range(7)]
++    + [(64000, seed) for seed in range(6)]
++)
++
++
++def prompt_tokens(length: int, seed: int) -> list[int]:
++    generator = random.Random(20260929 + seed * 100000 + length)
++    return [generator.randrange(5000, 150000) for _ in range(length)]
++
++
++def token_digest(tokens: list[int]) -> str:
++    return hashlib.sha256(
++        json.dumps(tokens, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("url", help="Local /v1/completions endpoint")
++    parser.add_argument("output", type=Path, help="JSONL result file")
++    parser.add_argument("--reference", type=Path, help="Previously captured TP2 JSONL")
++    parser.add_argument("--key-file", type=Path, help="Read API key without logging it")
++    parser.add_argument("--model", default="qwen3.8-27b-ac922")
++    parser.add_argument("--case", action="append", help="Run only this case ID")
++    args = parser.parse_args()
++
++    reference = {}
++    if args.reference is not None:
++        for line in args.reference.read_text().splitlines():
++            record = json.loads(line)
++            reference[record["case"]] = record
++    existing = {}
++    if args.output.exists():
++        for line in args.output.read_text().splitlines():
++            record = json.loads(line)
++            existing[record["case"]] = record
++    key = args.key_file.read_text().strip() if args.key_file else None
++
++    mismatches = sum(record.get("matches_tp2") is False for record in existing.values())
++    for length, seed in CASES:
++        case = f"p{length}-s{seed}"
++        if args.case and case not in args.case:
++            continue
++        prompt = prompt_tokens(length, seed)
++        prompt_hash = token_digest(prompt)
++        if case in existing:
++            if existing[case]["prompt_sha256"] != prompt_hash:
++                raise ValueError(f"saved prompt does not match {case}")
++            if args.reference is not None:
++                prior_digest = token_digest(reference[case]["output_token_ids"])
++                if existing[case].get("reference_token_sha256") != prior_digest:
++                    raise ValueError(f"saved TP3 comparison uses another TP2 {case}")
++                if existing[case].get("matches_tp2") not in (True, False):
++                    raise ValueError(f"saved TP3 comparison is incomplete for {case}")
++            print(f"SKIP {case}: already captured", flush=True)
++            continue
++        body = {
++            "model": args.model,
++            "prompt": prompt,
++            "max_tokens": 32,
++            "min_tokens": 32,
++            "temperature": 0,
++            "ignore_eos": True,
++            "return_token_ids": True,
++            "logprobs": 1,
++        }
++        headers = {"Content-Type": "application/json"}
++        if key:
++            headers["Authorization"] = f"Bearer {key}"
++        request = Request(args.url, data=json.dumps(body).encode(), headers=headers)
++        started = time.monotonic()
++        with urlopen(request, timeout=900) as response:
++            result = json.load(response)
++        elapsed = time.monotonic() - started
++        choice = result["choices"][0]
++        output_ids = choice["token_ids"]
++        if not isinstance(output_ids, list) or len(output_ids) != 32:
++            raise ValueError(f"{case}: expected 32 generated token IDs")
++        record = {
++            "case": case,
++            "prompt_length": length,
++            "prompt_sha256": prompt_hash,
++            "output_token_ids": output_ids,
++            "token_logprobs": (choice.get("logprobs") or {}).get("token_logprobs"),
++            "elapsed_s": round(elapsed, 3),
++        }
++        if args.reference is not None:
++            prior = reference[case]
++            if prior["prompt_sha256"] != prompt_hash:
++                raise ValueError(f"TP2 reference prompt does not match {case}")
++            record["reference_token_sha256"] = token_digest(prior["output_token_ids"])
++            record["matches_tp2"] = output_ids == prior["output_token_ids"]
++            if not record["matches_tp2"]:
++                mismatches += 1
++                record["first_mismatch"] = next(
++                    i
++                    for i, (old, new) in enumerate(
++                        zip(prior["output_token_ids"], output_ids)
++                    )
++                    if old != new
++                )
++        with args.output.open("a") as output:
++            output.write(json.dumps(record, separators=(",", ":")) + "\n")
++        status = "MATCH" if record.get("matches_tp2") else "DONE"
++        if record.get("matches_tp2") is False:
++            status = "DIFF"
++        print(f"{status} {case} {elapsed:.1f}s", flush=True)
++    if args.reference is not None and mismatches:
++        raise SystemExit(f"TP3 differs from TP2 in {mismatches} cases")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/ac922/serve_tp3_trial.sh b/tools/ac922/serve_tp3_trial.sh
+new file mode 100755
+index 000000000..df42ef47a
+--- /dev/null
++++ b/tools/ac922/serve_tp3_trial.sh
+@@ -0,0 +1,61 @@
++#!/bin/sh
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++set -eu
++
++mode=${1:-baseline}
++case "$mode" in
++    baseline) default_len=200000; default_util=0.90 ;;
++    dflash) default_len=65536; default_util=0.93 ;;
++    *) echo "usage: $0 baseline|dflash" >&2; exit 2 ;;
++esac
++model=${AC922_MODEL_PATH:-/home/debian/models/qwen3.8-27b-awq-nicosuter}
++draft=${AC922_DFLASH_MODEL:-/home/debian/models/qwen3.8-27b-dflash2}
++runner=${AC922_RUNNER:-/home/debian/ac922-vllm/run_1cat_525.sh}
++site=${AC922_VLLM_SITE:-/dev/shm/ac922-tp3/site-packages}
++
++test -d "$model"
++test -x "$runner"
++test -f "$site/vllm/model_executor/models/qwen3_5_tp3_heads.py"
++export AC922_RUN_ROOT=${AC922_RUN_ROOT:-/dev/shm/ac922-tp3}
++export AC922_RUNTIME_ROOT=${AC922_RUNTIME_ROOT:-/home/debian/ac922-vllm/runtime-525-20260928}
++export AC922_VLLM_SITE=$site
++export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
++export NCCL_P2P_LEVEL=NVL NCCL_IB_DISABLE=1 NCCL_NVLS_ENABLE=0
++export VLLM_SM70_QUANT_BACKEND=turbomind
++export VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND=1
++export VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_USE_V2_MODEL_RUNNER=0
++export VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=0
++export VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS=0
++export VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0
++export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
++
++overrides='{"ac922_tp3_head_replication":true,"text_config":{"num_attention_heads":36,"num_key_value_heads":6,"linear_num_key_heads":18,"linear_num_value_heads":54,"intermediate_size":17664}}'
++set -- "$runner" -m vllm.entrypoints.cli.main serve "$model" \
++    --tensor-parallel-size 3 --disable-custom-all-reduce \
++    --quantization compressed-tensors --dtype float16 \
++    --hf-overrides "$overrides" \
++    --max-model-len "${AC922_MAX_MODEL_LEN:-$default_len}" \
++    --max-num-seqs "${AC922_MAX_NUM_SEQS:-4}" \
++    --max-num-batched-tokens "${AC922_MAX_NUM_BATCHED_TOKENS:-4096}" \
++    --gpu-memory-utilization "${AC922_GPU_MEMORY_UTILIZATION:-$default_util}" \
++    --kv-cache-dtype fp8_e4m3 \
++    --language-model-only \
++    --limit-mm-per-prompt '{"image":0,"video":0}' \
++    --served-model-name qwen3.8-27b-ac922 \
++    --host 127.0.0.1 --port "${AC922_TP3_PORT:-8003}"
++
++case "$mode" in
++    baseline) ;;
++    dflash)
++        test -d "$draft"
++        export VLLM_USE_V2_MODEL_RUNNER=1
++        export AC922_TP3_DFLASH_REPLICATE=1
++        depth=${AC922_DFLASH_DEPTH:-3}
++        case "$depth" in 1|2|3|4|5|6|7) ;; *) echo "invalid DFlash depth" >&2; exit 2 ;; esac
++        spec="{\"method\":\"dflash\",\"model\":\"$draft\",\"num_speculative_tokens\":$depth,\"draft_tensor_parallel_size\":3,\"draft_sample_method\":\"probabilistic\",\"kv_cache_dtype\":\"auto\"}"
++        set -- "$@" --speculative-config "$spec"
++        ;;
++esac
++
++exec "$@"
+diff --git a/tools/ac922/stability_tp3.py b/tools/ac922/stability_tp3.py
+new file mode 100755
+index 000000000..36b577de4
+--- /dev/null
++++ b/tools/ac922/stability_tp3.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Sustain four real requests while recording scheduler and thermal evidence."""
++
++import argparse
++import json
++import random
++import re
++import subprocess
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from datetime import datetime, timezone
++from pathlib import Path
++from urllib.request import Request, urlopen
++
++METRIC = re.compile(
++    r"^vllm:(num_requests_running|num_requests_waiting)\{[^}]*\} ([0-9.]+)$", re.M
++)
++
++
++def write_jsonl(path: Path, record: dict, lock: threading.Lock) -> None:
++    with lock, path.open("a") as output:
++        output.write(json.dumps(record, separators=(",", ":")) + "\n")
++
++
++def gpu_temperatures() -> list[int]:
++    result = subprocess.run(
++        [
++            "nvidia-smi",
++            "--query-gpu=temperature.gpu",
++            "--format=csv,noheader,nounits",
++        ],
++        capture_output=True,
++        text=True,
++        timeout=5,
++        check=True,
++    )
++    return [int(value) for value in result.stdout.splitlines()[:3]]
++
++
++def monitor(
++    metrics_url: str,
++    path: Path,
++    stop: threading.Event,
++    finished: threading.Event,
++    lock: threading.Lock,
++) -> None:
++    last_thermal = 0.0
++    temperatures: list[int] = []
++    while not finished.is_set():
++        now = time.monotonic()
++        try:
++            with urlopen(metrics_url, timeout=5) as response:
++                values = {
++                    key: int(float(value))
++                    for key, value in METRIC.findall(response.read().decode())
++                }
++            if now - last_thermal >= 10:
++                temperatures = gpu_temperatures()
++                last_thermal = now
++            record = {
++                "time_utc": datetime.now(timezone.utc).isoformat(),
++                "running": values.get("num_requests_running", -1),
++                "waiting": values.get("num_requests_waiting", -1),
++                "gpu_c": temperatures,
++            }
++            write_jsonl(path, record, lock)
++            if temperatures and max(temperatures) >= 70:
++                stop.set()
++        except Exception as exc:
++            write_jsonl(path, {"monitor_error": repr(exc)}, lock)
++        finished.wait(1)
++
++
++def worker(
++    worker_id: int,
++    barrier: threading.Barrier,
++    deadline: float,
++    url: str,
++    model: str,
++    prompt_length: int,
++    max_tokens: int,
++    path: Path,
++    stop: threading.Event,
++    lock: threading.Lock,
++) -> None:
++    barrier.wait()
++    iteration = 0
++    while time.monotonic() < deadline and not stop.is_set():
++        generator = random.Random(20260929 + worker_id * 1000000 + iteration)
++        prompt = [generator.randrange(5000, 150000) for _ in range(prompt_length)]
++        body = {
++            "model": model,
++            "prompt": prompt,
++            "max_tokens": max_tokens,
++            "min_tokens": max_tokens,
++            "temperature": 0.0,
++            "ignore_eos": True,
++            "return_token_ids": True,
++            "cache_salt": f"tp3-stability-{worker_id}-{iteration}-{time.time_ns()}",
++        }
++        request = Request(
++            url,
++            data=json.dumps(body).encode(),
++            headers={"Content-Type": "application/json"},
++        )
++        started = time.monotonic()
++        record: dict[str, int | float | str] = {
++            "worker": worker_id,
++            "iteration": iteration,
++        }
++        try:
++            with urlopen(request, timeout=300) as response:
++                result = json.load(response)
++            token_ids = result["choices"][0]["token_ids"]
++            if len(token_ids) != max_tokens:
++                raise ValueError(f"generated {len(token_ids)} of {max_tokens}")
++            record["generated_tokens"] = len(token_ids)
++            record["elapsed_s"] = round(time.monotonic() - started, 3)
++        except Exception as exc:
++            record["error"] = repr(exc)
++            stop.set()
++        write_jsonl(path, record, lock)
++        iteration += 1
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--base", default="http://127.0.0.1:8003")
++    parser.add_argument("--output-prefix", type=Path, required=True)
++    parser.add_argument("--duration", type=int, default=1800)
++    parser.add_argument("--prompt-length", type=int, default=8000)
++    parser.add_argument("--max-tokens", type=int, default=512)
++    parser.add_argument("--model", default="qwen3.8-27b-ac922")
++    args = parser.parse_args()
++    requests_path = args.output_prefix.with_suffix(".requests.jsonl")
++    metrics_path = args.output_prefix.with_suffix(".metrics.jsonl")
++    summary_path = args.output_prefix.with_suffix(".summary.json")
++    if requests_path.exists() or metrics_path.exists() or summary_path.exists():
++        raise FileExistsError(args.output_prefix)
++    lock = threading.Lock()
++    stop = threading.Event()
++    finished = threading.Event()
++    barrier = threading.Barrier(4)
++    start = time.monotonic()
++    watcher = threading.Thread(
++        target=monitor,
++        args=(f"{args.base}/metrics", metrics_path, stop, finished, lock),
++        daemon=True,
++    )
++    watcher.start()
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        futures = [
++            pool.submit(
++                worker,
++                worker_id,
++                barrier,
++                start + args.duration,
++                f"{args.base}/v1/completions",
++                args.model,
++                args.prompt_length,
++                args.max_tokens,
++                requests_path,
++                stop,
++                lock,
++            )
++            for worker_id in range(4)
++        ]
++        for future in futures:
++            future.result()
++    finished.set()
++    watcher.join(timeout=5)
++    requests = [json.loads(line) for line in requests_path.read_text().splitlines()]
++    samples = [json.loads(line) for line in metrics_path.read_text().splitlines()]
++    errors = [record for record in requests if "error" in record]
++    temperatures = [max(s["gpu_c"]) for s in samples if s.get("gpu_c")]
++    summary = {
++        "elapsed_s": round(time.monotonic() - start, 1),
++        "completed_requests": len(requests) - len(errors),
++        "generated_tokens": sum(r.get("generated_tokens", 0) for r in requests),
++        "errors": errors,
++        "max_running": max((s.get("running", -1) for s in samples), default=-1),
++        "max_waiting": max((s.get("waiting", -1) for s in samples), default=-1),
++        "samples_running_four": sum(s.get("running") == 4 for s in samples),
++        "max_gpu_c": max(temperatures, default=None),
++    }
++    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
++    print(json.dumps(summary), flush=True)
++    if errors or stop.is_set() or summary["max_running"] < 4:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 57cd7a636..749a5993e 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -3,6 +3,7 @@
+ 
+ import copy
+ import math
++import os
+ from typing import TYPE_CHECKING, Any, Literal, get_args
+ 
+ from pydantic import Field, SkipValidation, field_validator, model_validator
+@@ -681,6 +682,31 @@ class SpeculativeConfig:
+                 text_config.num_kv_shared_layers = 0
+             hf_config.update({"n_predict": 1, "architectures": ["Gemma4MTPModel"]})
+ 
++        if (
++            os.environ.get("AC922_TP3_DFLASH_REPLICATE") == "1"
++            and initial_architecture == "DFlash2DraftModel"
++        ):
++            expected = {
++                "num_attention_heads": 32,
++                "num_key_value_heads": 8,
++                "head_dim": 128,
++                "intermediate_size": 17408,
++                "hidden_size": 5120,
++                "vocab_size": 248320,
++                "num_hidden_layers": 5,
++            }
++            for key, value in expected.items():
++                if getattr(hf_config, key, None) != value:
++                    raise ValueError(f"AC922 TP3 DFlash2 requires {key}={value}")
++            hf_config.update(
++                {
++                    "num_attention_heads": 36,
++                    "num_key_value_heads": 9,
++                    "intermediate_size": 17664,
++                    "ac922_tp3_draft_replication": True,
++                }
++            )
++
+         return hf_config
+ 
+     def __post_init__(self):
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index f94a612b8..2716ebe52 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -93,6 +93,7 @@ from .interfaces import (
+     _require_is_multimodal,
+ )
+ from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
++from .qwen3_5_tp3_heads import replicate_tp3_heads, validate_tp3_head_config
+ from .qwen3_next import (
+     Qwen3NextAttention,
+     Qwen3NextDecoderLayer,
+@@ -647,10 +648,20 @@ class Qwen3_5Model(Qwen3NextModel):
+         self.config = config
+ 
+         self.vocab_size = config.vocab_size
++        vocab_padding = (
++            {"padding_size": 192}  # LCM of the usual 64 and TP3.
++            if getattr(
++                vllm_config.model_config.hf_config,
++                "ac922_tp3_head_replication",
++                False,
++            )
++            else {}
++        )
+ 
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            **vocab_padding,
+         )
+ 
+         def get_layer(prefix: str):
+@@ -915,6 +926,15 @@ class Qwen3_5ForCausalLMBase(
+         self.model = Qwen3_5Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
++        vocab_padding = (
++            {"padding_size": 192}
++            if getattr(
++                vllm_config.model_config.hf_config,
++                "ac922_tp3_head_replication",
++                False,
++            )
++            else {}
++        )
+ 
+         if get_pp_group().is_last_rank:
+             if config.tie_word_embeddings:
+@@ -925,6 +945,7 @@ class Qwen3_5ForCausalLMBase(
+                     config.hidden_size,
+                     quant_config=self.quant_config,
+                     prefix=maybe_prefix(prefix, "lm_head"),
++                    **vocab_padding,
+                 )
+         else:
+             self.lm_head = PPMissingLayer()
+@@ -1070,12 +1091,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         self.is_multimodal_pruning_enabled = False
+ 
+         with self._mark_tower_model(vllm_config, {"image", "video"}):
+-            self.visual = Qwen3_VisionTransformer(
+-                config.vision_config,
+-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+-                quant_config=quant_config,
+-                prefix=maybe_prefix(prefix, "visual"),
+-            )
++            if getattr(config, "ac922_tp3_head_replication", False):
++                if any(
++                    multimodal_config.get_limit_per_prompt(modality) != 0
++                    for modality in ("image", "video")
++                ):
++                    raise ValueError("TP3 head replication requires text-only serving")
++                # The skipped tower still runs its constructor in the generic
++                # pruning context, where its 16 heads fail TP3 divisibility.
++                self.visual = nn.Identity()
++            else:
++                self.visual = Qwen3_VisionTransformer(
++                    config.vision_config,
++                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
++                    quant_config=quant_config,
++                    prefix=maybe_prefix(prefix, "visual"),
++                )
+ 
+         with self._mark_language_model(vllm_config):
+             self.language_model = Qwen3_5ForCausalLM(
+@@ -1186,6 +1217,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         )
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        if getattr(self.config, "ac922_tp3_head_replication", False):
++            layer_types = validate_tp3_head_config(self.config)
++            weights = replicate_tp3_heads(weights, layer_types)
+         loader = AutoWeightsLoader(
+             self,
+             skip_prefixes=["mtp."],
+diff --git a/vllm/model_executor/models/qwen3_5_tp3_heads.py b/vllm/model_executor/models/qwen3_5_tp3_heads.py
+new file mode 100644
+index 000000000..c862ff12c
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_5_tp3_heads.py
+@@ -0,0 +1,278 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Lossless TP3 head replication for the Qwen3.5 27B AWQ checkpoint.
++
++The checkpoint stays untouched. Each tensor is expanded before the regular
++quantized tensor-parallel loader sees it. This is deliberately specific to the
++24/4 attention and 16/48 GDN layout of this checkpoint.
++"""
++
++from collections.abc import Iterable, Iterator
++
++import torch
++
++
++def validate_tp3_head_config(config: object) -> list[str]:
++    text = getattr(config, "text_config", None)
++    if text is None:
++        raise ValueError("TP3 head replication requires a Qwen3.5 text_config")
++    expected = {
++        "num_attention_heads": 36,
++        "num_key_value_heads": 6,
++        "head_dim": 256,
++        "linear_num_key_heads": 18,
++        "linear_num_value_heads": 54,
++        "linear_key_head_dim": 128,
++        "linear_value_head_dim": 128,
++        "hidden_size": 5120,
++        "intermediate_size": 17664,
++    }
++    for key, value in expected.items():
++        if getattr(text, key, None) != value:
++            raise ValueError(f"TP3 head replication requires {key}={value}")
++    if not getattr(text, "attn_output_gate", False):
++        raise ValueError("TP3 head replication requires attention output gates")
++    layer_types = list(getattr(text, "layer_types", ()))
++    if len(layer_types) != 64 or layer_types.count("full_attention") != 16:
++        raise ValueError("TP3 head replication requires 16/48 hybrid layers")
++    if layer_types.count("linear_attention") != 48:
++        raise ValueError("TP3 head replication requires 48 GDN layers")
++    return layer_types
++
++
++def _shape_tensor(tensor: torch.Tensor, old: tuple[int, int], new: tuple[int, int]):
++    if tensor.shape != (2,) or tensor.tolist() != list(old):
++        raise ValueError(f"unexpected packed weight_shape: {tensor.tolist()}")
++    return tensor.new_tensor(new)
++
++
++def _repeat_output(
++    tensor: torch.Tensor,
++    suffix: str,
++    input_size: int,
++    segments: tuple[tuple[int, int], ...],
++    bits: int = 4,
++    dense_tail: tuple[int, ...] | None = None,
++) -> torch.Tensor:
++    old_output = sum(length for length, _ in segments)
++    new_output = old_output + sum(copy for _, copy in segments)
++    if suffix == "weight_shape":
++        return _shape_tensor(tensor, (old_output, input_size), (new_output, input_size))
++    output_pack = 8 if suffix == "weight_zero_point" else 1
++    if suffix == "weight_packed":
++        expected_width = input_size // (32 // bits)
++    elif suffix in ("weight_scale", "weight_zero_point"):
++        expected_width = input_size // 128
++    elif suffix in ("weight", "bias"):
++        expected_width = None
++    else:
++        raise ValueError(f"unsupported TP3 output tensor: {suffix}")
++    if tensor.shape[0] != old_output // output_pack:
++        raise ValueError(f"unexpected output size for {suffix}: {tensor.shape}")
++    if expected_width is not None and (
++        tensor.ndim != 2 or tensor.shape[1] != expected_width
++    ):
++        raise ValueError(f"unexpected packed shape for {suffix}: {tensor.shape}")
++    if (
++        suffix == "weight"
++        and dense_tail is not None
++        and tuple(tensor.shape[1:]) != dense_tail
++    ):
++        raise ValueError(f"unexpected dense shape for {suffix}: {tensor.shape}")
++    if suffix == "bias" and tensor.ndim != 1:
++        raise ValueError(f"unexpected bias shape: {tensor.shape}")
++    pieces = []
++    offset = 0
++    for length, copy in segments:
++        if length % output_pack or copy % output_pack or copy > length:
++            raise ValueError("unaligned TP3 output head copy")
++        length //= output_pack
++        copy //= output_pack
++        pieces.append(tensor.narrow(0, offset, length))
++        pieces.append(tensor.narrow(0, offset, copy))
++        offset += length
++    return torch.cat(pieces, dim=0)
++
++
++def _repeat_input(
++    tensor: torch.Tensor,
++    suffix: str,
++    output_size: int,
++    input_size: int,
++    copy_size: int,
++) -> torch.Tensor:
++    if suffix == "weight_shape":
++        return _shape_tensor(
++            tensor, (output_size, input_size), (output_size, input_size + copy_size)
++        )
++    if suffix == "weight_packed":
++        unit = 8  # Eight int4 input channels per int32.
++    elif suffix in ("weight_scale", "weight_zero_point"):
++        unit = 128  # One quantization group per 128 input channels.
++    elif suffix == "weight":
++        unit = 1
++    else:
++        raise ValueError(f"unsupported TP3 input tensor: {suffix}")
++    if input_size % unit or copy_size % unit:
++        raise ValueError("unaligned TP3 input head copy")
++    rows = output_size // (8 if suffix == "weight_zero_point" else 1)
++    if tensor.ndim != 2 or tensor.shape != (rows, input_size // unit):
++        raise ValueError(f"unexpected input shape for {suffix}: {tensor.shape}")
++    copy = tensor.narrow(1, 0, copy_size // unit)
++    rest = tensor.narrow(1, copy_size // unit, (input_size - copy_size) // unit)
++    if suffix in ("weight_scale", "weight"):
++        half = copy * 0.5
++        if not bool(torch.isfinite(copy).all()) or not torch.equal(half * 2, copy):
++            raise ValueError("TP3 output scale cannot be halved exactly")
++        copy = half
++    return torch.cat((copy, rest, copy), dim=1)
++
++
++def _pad_mlp_output(tensor: torch.Tensor, suffix: str) -> torch.Tensor:
++    old_output, added, input_size = 17408, 256, 5120
++    if suffix == "weight_shape":
++        return _shape_tensor(
++            tensor, (old_output, input_size), (old_output + added, input_size)
++        )
++    output_pack = 8 if suffix == "weight_zero_point" else 1
++    if suffix == "weight_packed":
++        width = input_size // 8
++    elif suffix in ("weight_scale", "weight_zero_point"):
++        width = input_size // 128
++    elif suffix == "weight":
++        width = input_size
++    else:
++        raise ValueError(f"unsupported TP3 MLP output tensor: {suffix}")
++    if tensor.shape != (old_output // output_pack, width):
++        raise ValueError(f"unexpected TP3 MLP output shape: {tensor.shape}")
++    fill = 1 if suffix == "weight_scale" else 0
++    pad = tensor.new_full((added // output_pack, width), fill)
++    return torch.cat((tensor, pad), dim=0)
++
++
++def _pad_mlp_input(tensor: torch.Tensor, suffix: str) -> torch.Tensor:
++    output_size, old_input, added = 5120, 17408, 256
++    if suffix == "weight_shape":
++        return _shape_tensor(
++            tensor, (output_size, old_input), (output_size, old_input + added)
++        )
++    if suffix == "weight_packed":
++        unit = 8
++    elif suffix in ("weight_scale", "weight_zero_point"):
++        unit = 128
++    elif suffix == "weight":
++        unit = 1
++    else:
++        raise ValueError(f"unsupported TP3 MLP input tensor: {suffix}")
++    rows = output_size // (8 if suffix == "weight_zero_point" else 1)
++    if tensor.shape != (rows, old_input // unit):
++        raise ValueError(f"unexpected TP3 MLP input shape: {tensor.shape}")
++    fill = 1 if suffix == "weight_scale" else 0
++    pad = tensor.new_full((rows, added // unit), fill)
++    return torch.cat((tensor, pad), dim=1)
++
++
++def replicate_tp3_heads(
++    weights: Iterable[tuple[str, torch.Tensor]],
++    layer_types: list[str],
++    *,
++    require_complete: bool = True,
++) -> Iterator[tuple[str, torch.Tensor]]:
++    """Expand one checkpoint tensor at a time; leave every other tensor alone."""
++    seen_shapes: set[tuple[int, str]] = set()
++    seen_dense: set[tuple[int, str]] = set()
++    for name, tensor in weights:
++        parts = name.split(".")
++        if parts[:3] != ["model", "language_model", "layers"] or len(parts) < 6:
++            yield name, tensor
++            continue
++        layer = int(parts[3])
++        if not 0 <= layer < len(layer_types):
++            raise ValueError(f"unexpected layer in TP3 checkpoint: {name}")
++        branch = parts[4]
++        projection = parts[5]
++        suffix = parts[6] if len(parts) == 7 else None
++        transform = None
++        if branch == "self_attn" and layer_types[layer] == "full_attention":
++            rows: dict[str, tuple[tuple[int, int], ...]] = {
++                "q_proj": ((12288, 6144),),  # Q and output gate, 512/head.
++                "k_proj": ((1024, 512),),
++                "v_proj": ((1024, 512),),
++            }
++            if projection in rows and suffix is not None:
++                transform = _repeat_output(
++                    tensor, suffix, 5120, rows[projection], dense_tail=(5120,)
++                )
++            elif projection == "o_proj" and suffix is not None:
++                transform = _repeat_input(tensor, suffix, 5120, 6144, 3072)
++        elif branch == "linear_attn" and layer_types[layer] == "linear_attention":
++            rows = {
++                "in_proj_qkv": ((2048, 256), (2048, 256), (6144, 768)),
++                "in_proj_z": ((6144, 768),),
++                "in_proj_a": ((48, 6),),
++                "in_proj_b": ((48, 6),),
++                "conv1d": ((2048, 256), (2048, 256), (6144, 768)),
++            }
++            if projection in rows and suffix is not None:
++                bits = 8 if projection in ("in_proj_qkv", "in_proj_z") else 4
++                dense_tail = (1, 4) if projection == "conv1d" else (5120,)
++                transform = _repeat_output(
++                    tensor,
++                    suffix,
++                    5120,
++                    rows[projection],
++                    bits,
++                    dense_tail=dense_tail,
++                )
++            elif projection == "out_proj" and suffix is not None:
++                transform = _repeat_input(tensor, suffix, 5120, 6144, 768)
++            elif projection in ("A_log", "dt_bias") and suffix is None:
++                transform = _repeat_output(
++                    tensor, "weight", 1, ((48, 6),), dense_tail=()
++                )
++        elif branch == "mlp" and suffix is not None:
++            if projection in ("gate_proj", "up_proj"):
++                transform = _pad_mlp_output(tensor, suffix)
++            elif projection == "down_proj":
++                transform = _pad_mlp_input(tensor, suffix)
++        if transform is None:
++            yield name, tensor
++            continue
++        if suffix == "weight_shape":
++            seen_shapes.add((layer, projection))
++        if branch == "linear_attn" and (
++            (projection in ("in_proj_a", "in_proj_b", "conv1d") and suffix == "weight")
++            or (projection in ("A_log", "dt_bias") and suffix is None)
++        ):
++            seen_dense.add((layer, projection))
++        yield name, transform
++
++    if not require_complete:
++        return
++    expected_shapes = {
++        (layer, projection)
++        for layer, kind in enumerate(layer_types)
++        for projection in (
++            ("q_proj", "k_proj", "v_proj", "o_proj")
++            if kind == "full_attention"
++            else ("in_proj_qkv", "in_proj_z", "out_proj")
++        )
++    }
++    expected_shapes.update(
++        (layer, projection)
++        for layer in range(len(layer_types))
++        for projection in ("gate_proj", "up_proj", "down_proj")
++    )
++    missing = expected_shapes - seen_shapes
++    if missing:
++        raise ValueError(f"TP3 checkpoint is missing packed projections: {missing}")
++    expected_dense = {
++        (layer, projection)
++        for layer, kind in enumerate(layer_types)
++        if kind == "linear_attention"
++        for projection in ("in_proj_a", "in_proj_b", "conv1d", "A_log", "dt_bias")
++    }
++    missing_dense = expected_dense - seen_dense
++    if missing_dense:
++        raise ValueError(f"TP3 checkpoint is missing GDN tensors: {missing_dense}")
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index f440b6ef8..5cb05bca5 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -448,6 +448,11 @@ class DFlashQwen3Model(nn.Module):
+             self.config.vocab_size,
+             self.config.hidden_size,
+             prefix=maybe_prefix(prefix, "embed_tokens"),
++            **(
++                {"padding_size": 192}
++                if getattr(self.config, "ac922_tp3_draft_replication", False)
++                else {}
++            ),
+         )
+ 
+         # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
+@@ -944,6 +949,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+             self.config.draft_vocab_size,
+             self.config.hidden_size,
+             prefix=maybe_prefix(prefix, "lm_head"),
++            **(
++                {"padding_size": 192}
++                if getattr(self.config, "ac922_tp3_draft_replication", False)
++                else {}
++            ),
+         )
+         self.logits_processor = LogitsProcessor(
+             self.config.draft_vocab_size, scale=logit_scale
+@@ -1089,6 +1099,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         return result
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
++        if getattr(self.config, "ac922_tp3_draft_replication", False):
++            from .qwen3_dflash_tp3_heads import (
++                replicate_dflash_tp3_weights,
++                validate_dflash_tp3_config,
++            )
++
++            validate_dflash_tp3_config(self.config)
++            weights = replicate_dflash_tp3_weights(weights)
+         model_weights = {}
+         includes_draft_id_mapping = False
+         includes_embed_tokens = False
+diff --git a/vllm/model_executor/models/qwen3_dflash_tp3_heads.py b/vllm/model_executor/models/qwen3_dflash_tp3_heads.py
+new file mode 100644
+index 000000000..5433c4949
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_dflash_tp3_heads.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""In-memory TP3 expansion of the five-layer Qwen3.8 DFlash2 drafter."""
++
++from collections.abc import Iterable, Iterator
++
++import torch
++
++from .qwen3_5_tp3_heads import (
++    _pad_mlp_input,
++    _pad_mlp_output,
++    _repeat_input,
++    _repeat_output,
++)
++
++
++def validate_dflash_tp3_config(config: object) -> None:
++    expected = {
++        "num_attention_heads": 36,
++        "num_key_value_heads": 9,
++        "head_dim": 128,
++        "intermediate_size": 17664,
++        "hidden_size": 5120,
++        "vocab_size": 248320,
++        "num_hidden_layers": 5,
++    }
++    for key, value in expected.items():
++        if getattr(config, key, None) != value:
++            raise ValueError(f"AC922 TP3 DFlash2 requires {key}={value}")
++
++
++def replicate_dflash_tp3_weights(
++    weights: Iterable[tuple[str, torch.Tensor]],
++    *,
++    require_complete: bool = True,
++) -> Iterator[tuple[str, torch.Tensor]]:
++    """Copy KV group zero and its four queries; zero-pad each MLP."""
++    seen: set[tuple[int, str, str]] = set()
++    for name, tensor in weights:
++        parts = name.split(".")
++        if len(parts) != 5 or parts[0] != "layers" or parts[4] != "weight":
++            yield name, tensor
++            continue
++        layer = int(parts[1])
++        if not 0 <= layer < 5:
++            raise ValueError(f"unexpected DFlash2 draft layer: {name}")
++        branch, projection = parts[2:4]
++        transform = None
++        if branch == "self_attn":
++            if projection == "q_proj":
++                transform = _repeat_output(
++                    tensor, "weight", 5120, ((4096, 512),), dense_tail=(5120,)
++                )
++            elif projection in ("k_proj", "v_proj"):
++                transform = _repeat_output(
++                    tensor, "weight", 5120, ((1024, 128),), dense_tail=(5120,)
++                )
++            elif projection == "o_proj":
++                transform = _repeat_input(tensor, "weight", 5120, 4096, 512)
++        elif branch == "mlp":
++            if projection in ("gate_proj", "up_proj"):
++                transform = _pad_mlp_output(tensor, "weight")
++            elif projection == "down_proj":
++                transform = _pad_mlp_input(tensor, "weight")
++        if transform is None:
++            yield name, tensor
++            continue
++        seen.add((layer, branch, projection))
++        yield name, transform
++
++    if not require_complete:
++        return
++    expected = {
++        (layer, branch, projection)
++        for layer in range(5)
++        for branch, projections in (
++            ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
++            ("mlp", ("gate_proj", "up_proj", "down_proj")),
++        )
++        for projection in projections
++    }
++    missing = expected - seen
++    if missing:
++        raise ValueError(f"AC922 TP3 DFlash2 is missing draft tensors: {missing}")
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 7a90f2b96..8894c4542 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1040,6 +1040,19 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
+     return len(page_sizes) == 1
+ 
+ 
++def _ac922_tp3_dflash_enabled(vllm_config: VllmConfig | None) -> bool:
++    return bool(
++        vllm_config is not None
++        and vllm_config.speculative_config is not None
++        and vllm_config.speculative_config.draft_model_config is not None
++        and getattr(
++            vllm_config.speculative_config.draft_model_config.hf_config,
++            "ac922_tp3_draft_replication",
++            False,
++        )
++    )
++
++
+ def unify_kv_cache_spec_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
+     vllm_config: VllmConfig | None = None,
+@@ -1062,18 +1075,25 @@ def unify_kv_cache_spec_page_size(
+         return kv_cache_spec
+ 
+     max_page_size = max(page_sizes)
++    ac922_tp3_dflash = _ac922_tp3_dflash_enabled(vllm_config)
++    # The TP3 DFlash drafter has three KV heads per rank while the target has
++    # two. Their FP16/FP8 page sizes have a 3:2 ratio, so neither is the
++    # other's multiple. The least common multiple preserves both layouts.
++    common_page_size = math.lcm(*page_sizes) if ac922_tp3_dflash else max_page_size
++    if ac922_tp3_dflash and common_page_size > 4 * max_page_size:
++        raise ValueError("AC922 TP3 DFlash KV page LCM is unexpectedly large")
+     new_kv_cache_spec = {}
+     for layer_name, layer_spec in kv_cache_spec.items():
+-        if layer_spec.page_size_bytes == max_page_size:
++        if layer_spec.page_size_bytes == common_page_size:
+             new_kv_cache_spec[layer_name] = layer_spec
+         else:
+             layer_page_size = layer_spec.page_size_bytes
+-            if max_page_size % layer_page_size != 0:
++            if common_page_size % layer_page_size != 0:
+                 raise NotImplementedError(
+-                    "The page size of the layer is not divisible by the "
+-                    "maximum page size. Cannot unify by adjusting block_size."
++                    "The layer page size does not divide the common page size. "
++                    "Cannot unify by adjusting block_size."
+                 )
+-            ratio = max_page_size // layer_page_size
++            ratio = common_page_size // layer_page_size
+             new_block_size = layer_spec.block_size * ratio
+             if (
+                 isinstance(layer_spec, MambaSpec)
+@@ -1095,12 +1115,12 @@ def unify_kv_cache_spec_page_size(
+                 isinstance(layer_spec, MambaSpec)
+                 or getattr(layer_spec, "page_size_padded", None) is not None
+             ):
+-                replace_args["page_size_padded"] = max_page_size
++                replace_args["page_size_padded"] = common_page_size
+             new_spec = replace(layer_spec, **replace_args)
+-            assert new_spec.page_size_bytes == max_page_size, (
++            assert new_spec.page_size_bytes == common_page_size, (
+                 f"Failed to unify KV page for {layer_name}: "
+                 f"spec={layer_spec!r}, old_page={layer_page_size}, "
+-                f"target_page={max_page_size}, replacement={replace_args!r}, "
++                f"target_page={common_page_size}, replacement={replace_args!r}, "
+                 f"new_page={new_spec.page_size_bytes}"
+             )
+             new_kv_cache_spec[layer_name] = new_spec
+@@ -1193,6 +1213,7 @@ def _prefer_padding_sliding_window_layers(
+ 
+ def _get_kv_cache_groups_uniform_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
++    vllm_config: VllmConfig | None = None,
+ ) -> list[KVCacheGroupSpec]:
+     """
+     Generates the KV cache groups for hybrid models with multiple
+@@ -1276,8 +1297,13 @@ def _get_kv_cache_groups_uniform_page_size(
+     # strategy if we want to support more complex patterns (e.g., 20 full + 30
+     # sw, where the group size should be 10).
+     layer_counts = [len(layers) for layers in same_type_layers.values()]
+-    group_size = _select_hybrid_kv_cache_group_size(layer_counts)
+-    group_size = _prefer_padding_sliding_window_layers(same_type_layers, group_size)
++    if _ac922_tp3_dflash_enabled(vllm_config) and sorted(layer_counts) == [5, 16, 48]:
++        # Fewer groups leave enough physical blocks for four live requests.
++        # The five sliding-window draft layers absorb 11 cheap padded slots.
++        group_size = 16
++    else:
++        group_size = _select_hybrid_kv_cache_group_size(layer_counts)
++        group_size = _prefer_padding_sliding_window_layers(same_type_layers, group_size)
+     if group_size != min(layer_counts):
+         logger.info(
+             "Using hybrid KV cache group size %d for layer counts %s",
+@@ -2485,7 +2511,7 @@ def get_kv_cache_groups(
+     # the page size of the layers. For cases cannot be unified, this function
+     # will raise an error.
+     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec, vllm_config)
+-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
++    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)
+ 
+     # Add hidden-state layers back with page aligned to the common page.
+     if hidden_specs:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index f26311afc..63a7e2ec6 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from typing import Any
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
+ 
+ import numpy as np
+ import torch
+@@ -20,7 +22,9 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
+     fuse_draft,
+     suffix_lookup,
+ )
+-from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import DFlash2NgramAssist
++
++if TYPE_CHECKING:
++    from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import DFlash2NgramAssist
+ 
+ logger = init_logger(__name__)
+ 
+@@ -487,6 +491,10 @@ class DFlash2Speculator(DFlashSpeculator):
+             and ngram_assist
+             and self.draft_block == self.num_speculative_steps
+         ):
++            from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import (
++                DFlash2NgramAssist,
++            )
++
+             min_ngram = speculative_config.prompt_lookup_min
+             max_ngram = speculative_config.prompt_lookup_max
+             assert min_ngram is not None and max_ngram is not None
+-- 
+2.50.1 (Apple Git-155)
+

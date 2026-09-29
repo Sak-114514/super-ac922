@@ -54,3 +54,21 @@ Get those from their respective owners under their own terms.
 The upstream source and this AC922 build material retain the repository's
 Apache-2.0 license. Each rebuilt dependency keeps its own upstream license;
 see [`release/THIRD_PARTY_NOTICES.md`](release/THIRD_PARTY_NOTICES.md).
+
+## TP3 + DFlash2 serving trial (2026-09-29)
+
+[`tp3-dflash2-trial/`](tp3-dflash2-trial/README.md) records a complete serving
+campaign on this tree: **lossless TP3 head replication** for the hybrid
+Qwen3.8-27B AWQ model (greedy parity 20/20 vs TP2), **DFlash2 speculative
+decoding at 110 tok/s single stream (82.2% acceptance)**, and a **30-minute
+4-way concurrency run at ~180 tok/s aggregate with zero errors**. The patch,
+harnesses, per-request records, and the full report are included.
+
+Operational pitfall records from the same campaign and earlier:
+
+- [`PITFALLS-FAN-THERMAL.md`](PITFALLS-FAN-THERMAL.md) — home-datacenter fan
+  policy: hard RPM boundaries, the OCC activation window, and the incident
+  where a fan-policy change cut power mid-compile.
+- [`PITFALLS-MEMORY-LOWMEM.md`](PITFALLS-MEMORY-LOWMEM.md) — "ghost DIMM"
+  HBM apertures, swap exhaustion, RAM-image build hygiene, and CUDA-graph
+  headroom on 16GB cards.

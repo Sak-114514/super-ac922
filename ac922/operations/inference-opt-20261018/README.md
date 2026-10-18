@@ -1,3 +1,9 @@
+# MIGRATED
+
+This campaign archive has moved to **[Sak-114514/ac922-monster](https://github.com/Sak-114514/ac922-monster)** — see `docs/` there (campaign overview, codex-notes, fixtures-records, engine source) and the [champions release](https://github.com/Sak-114514/ac922-monster/releases/tag/inference-opt-champions-202610).
+
+---
+
 # AC922 推理引擎优化战役档案（2026-10-16 → 10-18）
 
 目标：Qwen3.8-Flash-Next（179B MoE，512 专家 top-10，MTP-4 投机，48 层 = 36 GDN + 12 QSA）

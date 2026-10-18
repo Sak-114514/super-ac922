@@ -1,0 +1,22 @@
+[Unit]
+Description=AC922 NVIDIA 525 GPU startup after memory guard
+Wants=ac922-memory-guard.service
+After=ac922-memory-guard.service network.target
+RequiresMountsFor=/opt/ac922-nvidia525
+
+[Service]
+Type=oneshot
+Environment=LD_LIBRARY_PATH=/opt/ac922-nvidia525/lib
+ExecCondition=/bin/sh -c 'test "$(/bin/uname -r)" = "6.1.0-53-powerpc64le"'
+ExecStartPre=/usr/bin/systemctl -q is-active ac922-memory-guard.service
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 255
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 0
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 1
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 2
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 3
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 4
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -c 5
+ExecStartPre=/opt/ac922-nvidia525/bin/nvidia-modprobe -u -c 0
+ExecStart=/opt/ac922-nvidia525/bin/nvidia-persistenced --user root
+RemainAfterExit=yes
+TimeoutStartSec=120s

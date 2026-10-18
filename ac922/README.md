@@ -37,6 +37,18 @@ unverified at this snapshot.
 - [`scripts/`](scripts/) contains the host-specific build, smoke-test, and
   benchmark commands. The default paths reflect the original AC922 layout;
   `AC922_WORK_ROOT` and `AC922_BUILD_ROOT` are available where noted.
+- [`operations/`](operations/README.md) publishes the AC922 host/BMC guards,
+  NVIDIA startup helpers, SATA32 source patch, and opt-in proxy diagnostics.
+  It contains no generated subscription config, BMC backup, model, kernel
+  image, or vendor driver binary.
+- [`operations/inference-opt-20261018/`](operations/inference-opt-20261018/README.md)
+  archives the 2026-10-16 → 10-18 inference optimization campaign: design
+  blueprints, rolling plan notes, per-run outcome reports, and build driver
+  manifests for the graph-compose / flat-Meta6 / four-bank / MTP-shard /
+  UB-matrix stack that took 4-stream decode from 50.5 to 282.6 tok/s and
+  aggregate prefill from 1265 to 4084 tok/s on Qwen3.8-Flash-Next (all
+  semantic-gated). Binaries stay on the serving host; build JSONs carry the
+  per-file SHA-256 provenance.
 - [`dependencies/WHEEL_CACHE.sha256`](dependencies/WHEEL_CACHE.sha256) records
   the 98 downloaded or compiled toolchain/cache files in the build snapshot.
   It is an **artifact inventory**, not a resolver lock or a claim that every

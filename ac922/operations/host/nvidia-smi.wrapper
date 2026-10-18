@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "$(/bin/uname -r)" = "6.1.0-53-powerpc64le" ]; then
+    export LD_LIBRARY_PATH="/opt/ac922-nvidia525/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    exec /opt/ac922-nvidia525/sbin/nvidia-smi "$@"
+fi
+exec /usr/bin/nvidia-smi "$@"

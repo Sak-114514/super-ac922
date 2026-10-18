@@ -1,0 +1,10 @@
+[Unit]
+Description=Start AC922 NVIDIA 525 after boot settles
+
+[Timer]
+OnBootSec=60s
+AccuracySec=5s
+Unit=nvidia-startup.service
+
+[Install]
+WantedBy=timers.target

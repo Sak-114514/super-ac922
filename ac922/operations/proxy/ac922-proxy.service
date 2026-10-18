@@ -1,0 +1,12 @@
+[Unit]
+Description=AC922 opt-in localhost proxy (Guangdong to US)
+[Service]
+Type=simple
+ExecStart=/home/debian/.local/bin/sing-box run -c /home/debian/.config/ac922-proxy/config.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectHome=no
+
+[Install]
+WantedBy=default.target

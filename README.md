@@ -15,6 +15,18 @@
 > It is derived from upstream commit `db292f9a4`; model serving is not yet
 > verified on the AC922.
 
+> 🏆 **AC922 inference campaign (2026-10-16 → 10-18):** a dedicated llama.cpp-fork
+> runtime took **Qwen3.8-Flash-Next (179B MoE, 512-expert top-10, MTP)** on
+> **6× V100-SXM2 (dual 3-GPU NVLink islands, layer-pipeline + island TP3)** to
+> **282.6 tok/s 4-stream decode** and **4084 tok/s single-stream 64K prefill** —
+> graph compose, flat-Meta6 topology, four-bank KV scheduling, MTP vocab row
+> sharding, and a UB-matrix sweep, all semantic-gated (MTP acceptance
+> 96.5/90.8/86.5%). Champion binaries are on the
+> [champions release](https://github.com/Sak-114514/super-ac922/releases/tag/inference-opt-champions-202610);
+> design docs, plan notes, run outcome reports, and build manifests live in
+> [`ac922/operations/inference-opt-20261018/`](ac922/operations/inference-opt-20261018/README.md).
+> This is a custom serving runtime, not the vLLM engine path.
+
 AC922-specific host/BMC guards, NVIDIA startup helpers, and the source-only
 SATA32 kernel patch are indexed in [`ac922/operations/`](ac922/operations/README.md).
 
@@ -105,6 +117,9 @@ The table below prioritizes **complete-model / API / pure-decode / speculative-d
 | **DeepSeek-V4-Flash** | **8× V100** · PP2×TP4 · no-DSpark | combined quality-checked endpoint | **73.613–73.646 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) |
 | **DeepSeek-V4-Flash** | same PP2×TP4 strict control | dataset-quality pair | **73.539 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) · GSM8K 64/64 · HumanEval 29/32 |
 | **GLM-5.3-Flash-NVFP4** | 8× V100 · TP4/PP2 · E4M3 KV · no-MTP | 1K / 256 decode | **53.016 tok/s** | [#402](https://github.com/1CatAI/1Cat-vLLM/pull/402) · Draft quality audit |
+| **Qwen3.8-Flash-Next 179B MoE + MTP (custom AC922 runtime)** | **6× V100-SXM2** · dual-island layer-pipeline + island TP3 · Q8_0 KV · four-bank CUDA-graph compose | 4× 16K streams · 4-lane MTP d3 · 4-stream aggregate decode | **282.6 tok/s** | [champions release](https://github.com/Sak-114514/super-ac922/releases/tag/inference-opt-champions-202610) · semantic-gated · MTP acceptance 96.5/90.8/86.5% |
+| **Qwen3.8-Flash-Next 179B MoE (custom AC922 runtime)** | same runtime family (UB-matrix + op-chunk build) | single-stream 64K prefill | **4084 tok/s** | [campaign archive](https://github.com/Sak-114514/super-ac922/tree/ac922-ppc64le/ac922/operations/inference-opt-20261018) · semantic-gated |
+| **Qwen3.8-Flash-Next 179B MoE (custom AC922 runtime)** | graph-compose runtime (first stable compose build) | 4× 16K streams · aggregate decode | **140.3 tok/s** | [V31/V32 outcome report](https://github.com/Sak-114514/super-ac922/blob/ac922-ppc64le/ac922/operations/inference-opt-20261018/run-outcomes/V31-run-outcome.md) · 12/12 semantic, token-exact vs V27 |
 
 ---
 

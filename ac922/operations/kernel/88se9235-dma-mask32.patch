@@ -1,0 +1,15 @@
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -987,6 +987,12 @@
+ 		dma_bits = 32;
+ 	}
+ 
++	/* Preserve the 9235's high-register writes, but use translated DMA. */
++	if (pdev->vendor == PCI_VENDOR_ID_MARVELL_EXT && pdev->device == 0x9235) {
++		dma_bits = 32;
++		dev_info(&pdev->dev, "limiting Marvell 88SE9235 DMA mask to 32 bits\n");
++	}
++
+ 	/*
+ 	 * If the device fixup already set the dma_mask to some non-standard
+ 	 * value, don't extend it here. This happens on STA2X11, for example.

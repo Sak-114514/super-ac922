@@ -1,0 +1,8 @@
+#!/bin/sh
+if [ "$(/bin/uname -r)" != "6.1.0-53-powerpc64le" ]; then
+    echo "CUDA 525 environment requires AC922 kernel 6.1.0-53-powerpc64le" >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="/opt/ac922-cuda-compat-12-4/lib:/opt/ac922-nvidia525/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+exec "$@"

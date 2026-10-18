@@ -1,0 +1,10 @@
+#!/bin/sh
+cat <<'GRUB_ENTRY'
+menuentry 'AC922 SATA32 candidate' --class debian --class gnu-linux --class gnu --class os {
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root @BOOT_FILESYSTEM_UUID@
+    linux /vmlinux-@KERNEL_RELEASE@ root=UUID=@ROOT_FILESYSTEM_UUID@ ro mem=32G memhp_default_state=offline libata.force=noncq blacklist=nouveau console=tty0 console=hvc0
+    initrd /initrd.img-@KERNEL_RELEASE@-ac922-sata32
+}
+GRUB_ENTRY

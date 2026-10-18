@@ -11,6 +11,9 @@
 > It is derived from upstream commit `db292f9a4`; model serving is not yet
 > verified on the AC922.
 
+AC922-specific host/BMC guards, NVIDIA startup helpers, and the source-only
+SATA32 kernel patch are indexed in [`ac922/operations/`](ac922/operations/README.md).
+
 ## Make Volta Fast Again
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70

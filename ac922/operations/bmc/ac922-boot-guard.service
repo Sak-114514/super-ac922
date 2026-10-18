@@ -1,0 +1,18 @@
+[Unit]
+Description=AC922 guarded quiet fans across host startup
+After=obmc-chassis-poweron@0.target
+PartOf=obmc-chassis-poweron@0.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh /etc/ac922-fan-quiet/boot_pin.sh
+ExecStart=/usr/bin/python /etc/ac922-fan-quiet/boot_guard.py
+ExecStopPost=/bin/sh /etc/ac922-fan-quiet/boot_guard_restore.sh
+Restart=no
+NotifyAccess=main
+WatchdogSec=45s
+TimeoutStartSec=210s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=obmc-chassis-poweron@0.target

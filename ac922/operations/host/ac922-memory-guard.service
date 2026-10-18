@@ -1,0 +1,16 @@
+[Unit]
+Description=Keep AC922 phantom memory blocks offline
+After=local-fs.target
+Before=multi-user.target
+ConditionPathExists=/sys/devices/system/memory/auto_online_blocks
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/ac922-memory-guard.py
+Restart=always
+RestartSec=2s
+NotifyAccess=main
+WatchdogSec=60s
+
+[Install]
+WantedBy=multi-user.target

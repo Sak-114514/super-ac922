@@ -1,0 +1,8 @@
+# Per-user secrets and generated proxy profiles must never be committed.
+subscription.raw
+subscription*.yaml
+subscription*.conf
+config.json
+config.yaml
+*.secret
+*.token
